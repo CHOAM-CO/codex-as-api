@@ -293,87 +293,108 @@ class TestAnthropicRequestToInternal:
         else:
             assert "thinking" in str(exc_info.value)
 
-    def test_rejects_assistant_server_web_search_history(self):
-        with pytest.raises(ValueError) as exc_info:
-            anthropic_request_to_internal(
-                model="test",
-                messages=[
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "server_tool_use",
-                                "id": "srv_1",
-                                "name": "web_search",
-                                "input": {"query": "codex"},
-                            },
-                            {
-                                "type": "web_search_tool_result",
-                                "tool_use_id": "srv_1",
-                                "content": [
-                                    {"title": "Codex", "url": "https://example.com", "page_age": "1d"},
-                                ],
-                            },
-                            {"type": "text", "text": "Summary"},
-                        ],
-                    }
-                ],
-            )
-        assert "cannot be preserved" in str(exc_info.value)
-
-    @pytest.mark.parametrize(
-        "messages",
-        [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "call-1",
-                            "content": [
-                                {
-                                    "type": "search_result",
-                                    "title": "Docs",
-                                    "url": "https://docs.example",
-                                    "content": "body",
-                                }
-                            ],
-                        }
-                    ],
-                }
-            ],
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "document",
-                            "title": "Spec",
-                            "source": {"type": "text", "data": "document body"},
-                        }
-                    ],
-                }
-            ],
-            [
+    def test_converts_assistant_server_web_search_history(self):
+        messages, _, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[
                 {
                     "role": "assistant",
                     "content": [
                         {
-                            "type": "search_result",
-                            "title": "Docs",
-                            "url": "https://docs.example",
-                            "content": "body",
-                        }
+                            "type": "server_tool_use",
+                            "id": "srv_1",
+                            "name": "web_search",
+                            "input": {"query": "codex"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srv_1",
+                            "content": [
+                                {"title": "Codex", "url": "https://example.com", "page_age": "1d"},
+                            ],
+                        },
+                        {"type": "text", "text": "Summary"},
                     ],
                 }
             ],
+        )
+        assert len(messages) == 1
+        assert messages[0].role is MessageRole.ASSISTANT
+        assert '[server_tool_use id="srv_1" name="web_search" input={"query":"codex"}]' in messages[0].content
+        assert '[web_search_tool_result tool_use_id="srv_1"]' in messages[0].content
+        assert messages[0].content.endswith("Summary")
+
+    @pytest.mark.parametrize(
+        ("messages", "expected_role", "expected_fragment"),
+        [
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [
+                                    {
+                                        "type": "search_result",
+                                        "title": "Docs",
+                                        "url": "https://docs.example",
+                                        "content": "body",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                MessageRole.TOOL,
+                '[search_result source="https://docs.example" title="Docs"]\nbody\n[/search_result]',
+            ),
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "title": "Spec",
+                                "source": {"type": "text", "data": "document body"},
+                            }
+                        ],
+                    }
+                ],
+                MessageRole.USER,
+                '[document title="Spec"]\ndocument body\n[/document]',
+            ),
+            (
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "title": "Docs",
+                                "url": "https://docs.example",
+                                "content": "body",
+                            }
+                        ],
+                    }
+                ],
+                MessageRole.ASSISTANT,
+                '[search_result source="https://docs.example" title="Docs"]\nbody\n[/search_result]',
+            ),
         ],
     )
-    def test_rejects_unrepresentable_document_and_search_result_blocks(self, messages):
-        with pytest.raises(ValueError) as exc_info:
-            anthropic_request_to_internal(model="test", messages=messages)
-        assert "cannot be preserved" in str(exc_info.value)
+    def test_renders_document_and_search_result_blocks(
+        self,
+        messages,
+        expected_role,
+        expected_fragment,
+    ):
+        converted, _, _, _, _, _ = anthropic_request_to_internal(model="test", messages=messages)
+        assert len(converted) == 1
+        assert converted[0].role is expected_role
+        assert converted[0].content == expected_fragment
 
     def test_tools_conversion(self):
         _, tools, _, _, _, _ = anthropic_request_to_internal(
@@ -439,7 +460,18 @@ class TestAnthropicRequestToInternal:
         assert tools[0].name == "lookup"
         assert tools[0].strict is False
 
-    @pytest.mark.parametrize("metadata", [None, {}, {"user_id": None}, {"user_id": ""}, {"user_id": "user-123"}])
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"user_id": None},
+            {"user_id": ""},
+            {"user_id": "user-123"},
+            {"extra": "x", "optional_flag": None},
+            {"user_id": "ok", "extra": "x"},
+        ],
+    )
     def test_metadata_user_id_is_accepted_and_ignored(self, metadata):
         messages, _, _, _, _, _ = anthropic_request_to_internal(
             model="test",
@@ -459,8 +491,8 @@ class TestAnthropicRequestToInternal:
             {"user_id": 123},
             {"user_id": True},
             {"user_id": {}},
-            {"extra": "x"},
-            {"user_id": "ok", "extra": "x"},
+            {"extra": 123},
+            {"user_id": "ok", "extra": {}},
         ],
     )
     def test_rejects_malformed_metadata(self, metadata):
@@ -535,29 +567,45 @@ class TestAnthropicRequestToInternal:
         )
         assert tc == {"type": "function", "name": "get_weather"}
 
-    @pytest.mark.parametrize(
-        "tool",
-        [
-            {"type": "web_search", "name": "web_search"},
-            {"type": "web_search_20250305", "name": "web_search", "blocked_domains": ["example.com"]},
-            {
-                "type": "web_search_20260209",
-                "name": "web_search",
-                "allowed_domains": ["example.com"],
-                "max_uses": 8,
-                "strict": False,
+    def test_hosted_web_search_tools_convert_and_blocked_domains_rejected(self):
+        _, tools, _, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[
+                {
+                    "type": "web_search_20260209",
+                    "name": "web_search",
+                    "allowed_domains": ["example.com"],
+                    "max_uses": 8,
+                    "strict": False,
+                    "user_location": {"type": "approximate", "country": "US"},
+                }
+            ],
+        )
+        assert tools is not None
+        assert len(tools) == 1
+        assert tools[0].name == "web_search"
+        assert tools[0].parameters == {
+            "__codex_as_api_tool_type": "web_search",
+            "openai_tool": {
+                "type": "web_search",
+                "filters": {"allowed_domains": ["example.com"]},
                 "user_location": {"type": "approximate", "country": "US"},
             },
-        ],
-    )
-    def test_hosted_web_search_tools_are_rejected(self, tool):
+        }
         with pytest.raises(ValueError) as exc_info:
             anthropic_request_to_internal(
                 model="test",
                 messages=[{"role": "user", "content": "hi"}],
-                tools=[tool],
+                tools=[
+                    {
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "blocked_domains": ["example.com"],
+                    }
+                ],
             )
-        assert "cannot be represented losslessly" in str(exc_info.value)
+        assert "blocked_domains" in str(exc_info.value)
 
     @pytest.mark.parametrize("tool_type", ["web_search_20240101", "web_search_future"])
     def test_unknown_web_search_tool_versions_fail_loudly(self, tool_type):
@@ -569,14 +617,13 @@ class TestAnthropicRequestToInternal:
             )
         assert "type" in str(exc_info.value)
 
-    def test_hosted_web_search_tool_choice_is_rejected(self):
-        with pytest.raises(ValueError) as exc_info:
-            anthropic_request_to_internal(
-                model="test",
-                messages=[{"role": "user", "content": "hi"}],
-                tool_choice={"type": "tool", "name": "web_search"},
-            )
-        assert "cannot be represented losslessly" in str(exc_info.value)
+    def test_hosted_web_search_tool_choice_is_converted(self):
+        _, _, tc, _, _, _ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tool_choice={"type": "tool", "name": "web_search"},
+        )
+        assert tc == {"type": "web_search"}
 
     def test_tool_choice_none(self):
         _, _, tc, _, _, _ = anthropic_request_to_internal(
@@ -1383,7 +1430,7 @@ class TestInternalResponseToAnthropic:
             assert sum(usage[k] for k in buckets) == 100
             assert source.prompt_tokens == 100
 
-    def test_web_search_provider_output_is_rejected(self):
+    def test_web_search_provider_output_is_converted(self):
         resp = AssistantResponse(
             content="Final answer",
             tool_calls=(),
@@ -1401,9 +1448,27 @@ class TestInternalResponseToAnthropic:
                 ]
             },
         )
-        with pytest.raises(ChatGPTOAuthProtocolError) as exc_info:
-            internal_response_to_anthropic(resp, "m", "msg_1")
-        assert "cannot be represented losslessly" in str(exc_info.value)
+        converted = internal_response_to_anthropic(resp, "m", "msg_1")
+        assert converted["content"] == [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_ws1",
+                "name": "web_search",
+                "input": {"query": "latest news"},
+                "caller": {"type": "direct"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_ws1",
+                "content": [{"type": "web_search_result", "url": "https://example.com", "title": "Example"}],
+                "caller": {"type": "direct"},
+            },
+            {"type": "text", "text": "Final answer", "citations": None},
+        ]
+        assert converted["usage"]["server_tool_use"] == {
+            "web_search_requests": 1,
+            "web_fetch_requests": 0,
+        }
 
     @pytest.mark.parametrize(
         "server_tool_use",
@@ -1795,7 +1860,7 @@ class TestAnthropicStreamAdapter:
         assert block_starts[0]["index"] == 0
         assert block_starts[1]["index"] == 1
 
-    def test_web_search_call_stream_is_rejected(self):
+    def test_web_search_call_stream_is_converted(self):
         events = [
             {
                 "type": "web_search_call",
@@ -1810,9 +1875,18 @@ class TestAnthropicStreamAdapter:
                 "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
             },
         ]
-        with pytest.raises(ChatGPTOAuthProtocolError) as exc_info:
-            self._collect_events(events)
-        assert "cannot be represented losslessly" in str(exc_info.value)
+        result = self._collect_events(events)
+        starts = [event for event in result if event["type"] == "content_block_start"]
+        assert [event["content_block"]["type"] for event in starts] == [
+            "server_tool_use",
+            "web_search_tool_result",
+            "text",
+        ]
+        deltas = [event for event in result if event["type"] == "message_delta"]
+        assert deltas[0]["usage"]["server_tool_use"] == {
+            "web_search_requests": 1,
+            "web_fetch_requests": 0,
+        }
 
     def test_only_diagnostic_reasoning_section_break_is_ignored(self):
         result = self._collect_events(

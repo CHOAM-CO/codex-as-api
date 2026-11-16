@@ -112,7 +112,7 @@ export function anthropicRequestToInternal(opts: {
     tools: internalTools,
     toolChoice: internalToolChoice,
     parallelToolCalls,
-    stop: opts.stopSequences ?? null,
+    stop: opts.stopSequences && opts.stopSequences.length > 0 ? opts.stopSequences : null,
     reasoningEffort,
     ...(reasoningSummary === undefined ? {} : { reasoningSummary }),
     ...(thinkingDisplay === undefined ? {} : { thinkingDisplay }),
@@ -225,6 +225,20 @@ function convertUserMessage(
             );
             const imageUrl = anthropicImageSourceUrl(p.source);
             toolResultImages.push(imageUrl);
+          } else if (p.type === "search_result") {
+            textPieces.push(
+              renderSearchResultBlock(
+                p,
+                `tool_result block ${blockIndex} content ${partIndex}`,
+              ),
+            );
+          } else if (p.type === "document") {
+            textPieces.push(
+              renderDocumentBlock(
+                p,
+                `tool_result block ${blockIndex} content ${partIndex}`,
+              ),
+            );
           } else {
             throw new ChatGPTOAuthInvalidRequestError(
               `tool_result block ${blockIndex} has unsupported content type ${String(p.type)}`,
@@ -253,6 +267,10 @@ function convertUserMessage(
       assertAllowedFields(b, ["type", "source"], `user image block ${blockIndex}`);
       const imageUrl = anthropicImageSourceUrl(b.source);
       imageUrls.push(imageUrl);
+    } else if (blockType === "search_result") {
+      textParts.push(renderSearchResultBlock(b, `user search_result block ${blockIndex}`));
+    } else if (blockType === "document") {
+      textParts.push(renderDocumentBlock(b, `user document block ${blockIndex}`));
     } else {
       throw new ChatGPTOAuthInvalidRequestError(
         `user content block ${blockIndex} has unsupported type ${String(blockType)}`,
@@ -262,6 +280,189 @@ function convertUserMessage(
   if (textParts.length || imageUrls.length) {
     out.push({ role: MessageRole.USER, content: textParts.join(""), images: [...imageUrls] });
   }
+}
+
+function renderDocumentBlock(
+  block: Record<string, unknown>,
+  location: string,
+): string {
+  validateNullableOmittedField(block, "citations", location);
+  assertAllowedFields(block, ["type", "source", "title", "context", "citations"], location);
+  const source = requireRecord(block.source, `${location} source`);
+  if (source.type === "text") {
+    assertAllowedFields(source, ["type", "media_type", "data"], `${location} text source`);
+    if (
+      source.media_type != null
+      && source.media_type !== "text/plain"
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${location} text source media_type must be text/plain`,
+      );
+    }
+    const data = requireString(source.data, `${location} text source data`);
+    return formatDocumentText(block, data, location);
+  }
+  if (source.type === "content") {
+    assertAllowedFields(source, ["type", "content"], `${location} content source`);
+    const content = source.content;
+    if (typeof content === "string") {
+      return formatDocumentText(block, content, location);
+    }
+    if (!Array.isArray(content)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${location} content source content must be a string or array`,
+      );
+    }
+    const parts: string[] = [];
+    for (const [partIndex, part] of content.entries()) {
+      const p = requireRecord(part, `${location} content ${partIndex}`);
+      validateNullableOmittedField(p, "citations", `${location} content ${partIndex}`);
+      assertAllowedFields(p, ["type", "text", "citations"], `${location} content ${partIndex}`);
+      if (p.type !== "text" || typeof p.text !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `${location} content ${partIndex} must be a text block`,
+        );
+      }
+      parts.push(p.text);
+    }
+    return formatDocumentText(block, parts.join(""), location);
+  }
+  throw new ChatGPTOAuthInvalidRequestError(
+    `${location} source type ${String(source.type)} is not supported by the Codex OAuth transport`,
+  );
+}
+
+function formatDocumentText(
+  block: Record<string, unknown>,
+  body: string,
+  location: string,
+): string {
+  const header: string[] = [];
+  if (block.title != null) {
+    header.push(`title: ${requireString(block.title, `${location} title`)}`);
+  }
+  if (block.context != null) {
+    header.push(`context: ${requireString(block.context, `${location} context`)}`);
+  }
+  return header.length
+    ? `[document ${header.join(" | ")}]\n${body}`
+    : body;
+}
+
+function renderSearchResultBlock(
+  block: Record<string, unknown>,
+  location: string,
+): string {
+  validateNullableOmittedField(block, "citations", location);
+  assertAllowedFields(
+    block,
+    ["type", "source", "url", "title", "content", "citations"],
+    location,
+  );
+  const rawSource = Object.hasOwn(block, "source") ? block.source : block.url;
+  const source = requireString(rawSource, `${location} source`);
+  const title = requireString(block.title, `${location} title`);
+  let body: string;
+  if (typeof block.content === "string") {
+    body = block.content;
+  } else if (Array.isArray(block.content)) {
+    const textParts: string[] = [];
+    for (const [partIndex, part] of block.content.entries()) {
+      const p = requireRecord(part, `${location} content ${partIndex}`);
+      validateNullableOmittedField(p, "citations", `${location} content ${partIndex}`);
+      assertAllowedFields(p, ["type", "text", "citations"], `${location} content ${partIndex}`);
+      if (p.type !== "text" || typeof p.text !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `${location} content ${partIndex} must be a text block`,
+        );
+      }
+      textParts.push(p.text);
+    }
+    body = textParts.join("\n");
+  } else {
+    throw new ChatGPTOAuthInvalidRequestError(`${location} content must be a string or array`);
+  }
+  return body
+    ? `[search_result title=${JSON.stringify(title)} source=${JSON.stringify(source)}]\n${body}`
+    : `[search_result title=${JSON.stringify(title)} source=${JSON.stringify(source)}]`;
+}
+
+function renderServerToolUseBlock(
+  block: Record<string, unknown>,
+  blockIndex: number,
+): string {
+  const location = `assistant server_tool_use block ${blockIndex}`;
+  assertAllowedFields(block, ["type", "id", "name", "input", "caller"], location);
+  const id = requireString(block.id, `${location} id`);
+  const name = requireString(block.name, `${location} name`);
+  if (name !== "web_search") {
+    throw new ChatGPTOAuthInvalidRequestError(`${location} name must be web_search`);
+  }
+  if (Object.hasOwn(block, "caller")) {
+    const caller = requireRecord(block.caller, `${location} caller`);
+    assertAllowedFields(caller, ["type"], `${location} caller`);
+    if (caller.type !== "direct") {
+      throw new ChatGPTOAuthInvalidRequestError(`${location} caller.type must be direct`);
+    }
+  }
+  const input = requireRecord(block.input, `${location} input`);
+  return `[server_tool_use id=${JSON.stringify(id)} name=${JSON.stringify(name)} input=${JSON.stringify(input)}]`;
+}
+
+function renderWebSearchToolResultBlock(
+  block: Record<string, unknown>,
+  blockIndex: number,
+): string {
+  const location = `assistant web_search_tool_result block ${blockIndex}`;
+  assertAllowedFields(block, ["type", "tool_use_id", "content", "caller"], location);
+  const toolUseId = requireString(block.tool_use_id, `${location} tool_use_id`);
+  if (Object.hasOwn(block, "caller")) {
+    const caller = requireRecord(block.caller, `${location} caller`);
+    assertAllowedFields(caller, ["type"], `${location} caller`);
+    if (caller.type !== "direct") {
+      throw new ChatGPTOAuthInvalidRequestError(`${location} caller.type must be direct`);
+    }
+  }
+  if (Array.isArray(block.content)) {
+    for (const [resultIndex, item] of block.content.entries()) {
+      const result = requireRecord(item, `${location} content ${resultIndex}`);
+      assertAllowedFields(
+        result,
+        ["type", "url", "title", "encrypted_content", "page_age"],
+        `${location} content ${resultIndex}`,
+      );
+      if (result.type !== "web_search_result") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `${location} content ${resultIndex} must be a web_search_result`,
+        );
+      }
+      requireString(result.url, `${location} content ${resultIndex} url`);
+      if (result.title != null) {
+        requireString(result.title, `${location} content ${resultIndex} title`);
+      }
+      if (result.encrypted_content != null) {
+        requireString(
+          result.encrypted_content,
+          `${location} content ${resultIndex} encrypted_content`,
+        );
+      }
+      if (result.page_age != null) {
+        requireString(result.page_age, `${location} content ${resultIndex} page_age`);
+      }
+    }
+    return `[web_search_tool_result tool_use_id=${JSON.stringify(toolUseId)} content=${JSON.stringify(block.content)}]`;
+  }
+  const error = requireRecord(block.content, `${location} content`);
+  assertAllowedFields(error, ["type", "error_code"], `${location} content`);
+  if (
+    error.type !== "web_search_tool_result_error"
+    || typeof error.error_code !== "string"
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `${location} content must be a web_search_result array or web_search_tool_result_error`,
+    );
+  }
+  return `[web_search_tool_result tool_use_id=${JSON.stringify(toolUseId)} error=${JSON.stringify(error.error_code)}]`;
 }
 
 function anthropicImageSourceUrl(sourceValue: unknown): string {
@@ -423,10 +624,14 @@ function convertAssistantMessage(
           `assistant redacted_thinking block ${blockIndex} requires string data`,
         );
       }
-    } else if (blockType === "server_tool_use" || blockType === "web_search_tool_result") {
-      throw new ChatGPTOAuthInvalidRequestError(
-        `${String(blockType)} history cannot be represented by the Codex OAuth transport`,
-      );
+    } else if (blockType === "server_tool_use") {
+      textParts.push(renderServerToolUseBlock(b, blockIndex));
+    } else if (blockType === "web_search_tool_result") {
+      textParts.push(renderWebSearchToolResultBlock(b, blockIndex));
+    } else if (blockType === "search_result") {
+      textParts.push(renderSearchResultBlock(b, `assistant search_result block ${blockIndex}`));
+    } else if (blockType === "document") {
+      textParts.push(renderDocumentBlock(b, `assistant document block ${blockIndex}`));
     } else {
       throw new ChatGPTOAuthInvalidRequestError(
         `assistant content block ${blockIndex} has unsupported type ${String(blockType)}`,
@@ -480,11 +685,16 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
     if (Object.hasOwn(tool, "output_schema")) {
       throw new ChatGPTOAuthInvalidRequestError(`tool ${index} output_schema is not supported`);
     }
-    const webSearch = isAnthropicWebSearchTool(tool);
-    if (webSearch) {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "Anthropic hosted web_search cannot be represented losslessly by this facade",
-      );
+    const webSearch = convertAnthropicWebSearchTool(tool, index);
+    if (webSearch !== null) {
+      if (toolNames.has("web_search")) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools contains duplicate name "web_search"`,
+        );
+      }
+      toolNames.add("web_search");
+      result.push(webSearch);
+      continue;
     }
     if (Object.hasOwn(tool, "strict") && typeof tool.strict !== "boolean") {
       throw new ChatGPTOAuthInvalidRequestError(
@@ -533,10 +743,137 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
   return result;
 }
 
-function isAnthropicWebSearchTool(tool: Record<string, unknown>): boolean {
-  return tool.name === "web_search" &&
-    typeof tool.type === "string" &&
-    ["web_search", "web_search_20250305", "web_search_20260209"].includes(tool.type);
+function convertAnthropicWebSearchTool(
+  tool: Record<string, unknown>,
+  index: number,
+): ToolSchema | null {
+  const toolType = tool.type;
+  if (
+    tool.name !== "web_search"
+    || typeof toolType !== "string"
+    || !["web_search", "web_search_20250305", "web_search_20260209"].includes(toolType)
+  ) {
+    return null;
+  }
+  assertAllowedFields(
+    tool,
+    [
+      "type",
+      "name",
+      "allowed_domains",
+      "blocked_domains",
+      "max_uses",
+      "strict",
+      "user_location",
+      "defer_loading",
+      "eager_input_streaming",
+      "allowed_callers",
+      "output_schema",
+    ],
+    `tool ${index}`,
+  );
+  if (
+    Object.hasOwn(tool, "strict")
+    && tool.strict !== null
+    && typeof tool.strict !== "boolean"
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `tool ${index} strict must be a boolean or null`,
+    );
+  }
+  if (tool.strict === true) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `tool ${index} web_search strict mode is not supported by the Codex OAuth transport`,
+    );
+  }
+  if (tool.blocked_domains != null) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `tool ${index} web_search blocked_domains is not supported by the Codex OAuth transport`,
+    );
+  }
+  if (
+    tool.max_uses != null
+    && (
+      typeof tool.max_uses !== "number"
+      || !Number.isSafeInteger(tool.max_uses)
+      || tool.max_uses <= 0
+    )
+  ) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      `tool ${index} web_search max_uses must be a positive integer`,
+    );
+  }
+  const openaiTool: Record<string, unknown> = { type: "web_search" };
+  if (tool.allowed_domains != null) {
+    if (
+      !Array.isArray(tool.allowed_domains)
+      || tool.allowed_domains.length === 0
+      || tool.allowed_domains.some(
+        (domain) => typeof domain !== "string" || domain.trim().length === 0,
+      )
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `tool ${index} web_search allowed_domains must be a non-empty array of strings`,
+      );
+    }
+    openaiTool.filters = { allowed_domains: tool.allowed_domains };
+  }
+  if (tool.user_location != null) {
+    openaiTool.user_location = normalizeWebSearchUserLocation(
+      tool.user_location,
+      `tool ${index} web_search user_location`,
+    );
+  }
+  return {
+    name: "web_search",
+    parameters: {
+      __codex_as_api_tool_type: "web_search",
+      openai_tool: openaiTool,
+    },
+  };
+}
+
+function normalizeWebSearchUserLocation(
+  value: unknown,
+  location: string,
+): Record<string, string> {
+  const loc = requireRecord(value, location);
+  assertAllowedFields(
+    loc,
+    ["type", "city", "country", "region", "timezone"],
+    location,
+  );
+  if (loc.type !== "approximate") {
+    throw new ChatGPTOAuthInvalidRequestError(`${location}.type must be approximate`);
+  }
+  const out: Record<string, string> = { type: "approximate" };
+  const city = requireOptionalNonEmptyString(loc.city, `${location}.city`);
+  const country = requireOptionalNonEmptyString(loc.country, `${location}.country`);
+  const region = requireOptionalNonEmptyString(loc.region, `${location}.region`);
+  const timezone = requireOptionalNonEmptyString(loc.timezone, `${location}.timezone`);
+  if (city !== null) out.city = city;
+  if (country !== null) {
+    if (!/^[A-Za-z]{2}$/.test(country)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `${location}.country must be a two-letter ISO country code`,
+      );
+    }
+    out.country = country;
+  }
+  if (region !== null) out.region = region;
+  if (timezone !== null) out.timezone = timezone;
+  return out;
+}
+
+function requireOptionalNonEmptyString(
+  value: unknown,
+  location: string,
+): string | null {
+  if (value == null) return null;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ChatGPTOAuthInvalidRequestError(`${location} must be a non-empty string`);
+  }
+  return value;
 }
 
 function convertToolChoice(
@@ -574,9 +911,10 @@ function convertToolChoice(
       throw new ChatGPTOAuthInvalidRequestError("tool_choice type tool requires a non-empty name");
     }
     if (tc.name === "web_search") {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "Anthropic hosted web_search cannot be represented losslessly by this facade",
-      );
+      return {
+        toolChoice: { type: "web_search" },
+        parallelToolCalls,
+      };
     }
     return {
       toolChoice: { type: "function", name: tc.name },
@@ -692,11 +1030,27 @@ function validateNullableOmittedField(
   field: string,
   location: string,
 ): void {
-  if (Object.hasOwn(value, field) && value[field] !== null) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      `${location}.${field} cannot be preserved by this facade`,
-    );
+  if (!Object.hasOwn(value, field) || value[field] === null) {
+    return;
   }
+  if (field === "citations") {
+    const citations = value[field];
+    if (Array.isArray(citations) && citations.length === 0) {
+      return;
+    }
+    if (
+      typeof citations === "object"
+      && citations !== null
+      && !Array.isArray(citations)
+      && Object.keys(citations).length === 1
+      && (citations as Record<string, unknown>).enabled === false
+    ) {
+      return;
+    }
+  }
+  throw new ChatGPTOAuthInvalidRequestError(
+    `${location}.${field} cannot be preserved by this facade`,
+  );
 }
 
 function convertReasoningEffort(
@@ -910,8 +1264,6 @@ export function internalResponseToAnthropic(
   const suppressReasoning = thinkingDisabled || thinkingOmitted;
   const fallbackBackendModel = opts?.backendModel ?? model;
 
-  rejectUnrepresentableResponseEvents(response.raw);
-
   const reasoningItems = resolveResponseReasoningItems(response, fallbackBackendModel);
   if (reasoningItems.length > 0) {
     if (!thinkingDisabled) {
@@ -952,6 +1304,8 @@ export function internalResponseToAnthropic(
     });
   }
 
+  content.push(...webSearchContentBlocksFromRaw(response.raw));
+
   if (response.content) {
     content.push({ type: "text", text: response.content, citations: null });
   }
@@ -976,6 +1330,15 @@ export function internalResponseToAnthropic(
     usageFromInternalResponse(response.usage),
     response.raw,
   );
+  if (usageDict.server_tool_use == null) {
+    const webSearchRequests = countWebSearchEvents(response.raw);
+    if (webSearchRequests > 0) {
+      usageDict.server_tool_use = {
+        web_search_requests: webSearchRequests,
+        web_fetch_requests: 0,
+      };
+    }
+  }
 
   return {
     id: requestId,
@@ -1012,18 +1375,90 @@ function parseAnthropicToolArguments(value: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function rejectUnrepresentableResponseEvents(raw: Record<string, unknown> | null): void {
+function webSearchContentBlocksFromRaw(
+  raw: Record<string, unknown> | null,
+): Record<string, unknown>[] {
   const events = rawEvents(raw);
+  const blocks: Record<string, unknown>[] = [];
   for (const [index, event] of events.entries()) {
     if (typeof event !== "object" || event === null || Array.isArray(event)) {
       throw new ChatGPTOAuthProtocolError(`provider raw event ${index} must be an object`);
     }
     const e = event as Record<string, unknown>;
     if (e.type !== "web_search_call") continue;
-    throw new ChatGPTOAuthProtocolError(
-      "provider web_search_call output cannot be represented losslessly by the Anthropic facade",
-    );
+    if (typeof e.id !== "string") {
+      throw new ChatGPTOAuthProtocolError("provider web_search_call requires a string id");
+    }
+    if (typeof e.input !== "object" || e.input === null || Array.isArray(e.input)) {
+      throw new ChatGPTOAuthProtocolError("provider web_search_call requires an object input");
+    }
+    const input = e.input as Record<string, unknown>;
+    if (typeof input.query !== "string") {
+      throw new ChatGPTOAuthProtocolError("provider web_search_call input requires a string query");
+    }
+    const results = normalizeWebSearchResults(e.content);
+    blocks.push({
+      type: "server_tool_use",
+      id: e.id,
+      name: "web_search",
+      input: { query: input.query },
+      caller: { type: "direct" },
+    });
+    blocks.push({
+      type: "web_search_tool_result",
+      tool_use_id: e.id,
+      content: results,
+      caller: { type: "direct" },
+    });
   }
+  return blocks;
+}
+
+function countWebSearchEvents(raw: Record<string, unknown> | null): number {
+  let count = 0;
+  for (const event of rawEvents(raw)) {
+    if ((event as Record<string, unknown>).type === "web_search_call") {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function normalizeWebSearchResults(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    throw new ChatGPTOAuthProtocolError("provider web_search_call content must be an array");
+  }
+  return value.map((item, index) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new ChatGPTOAuthProtocolError(
+        `provider web_search_call result ${index} must be an object`,
+      );
+    }
+    const r = item as Record<string, unknown>;
+    if (typeof r.url !== "string" || r.url.length === 0) {
+      throw new ChatGPTOAuthProtocolError(
+        `provider web_search_call result ${index} requires a non-empty url`,
+      );
+    }
+    if (r.title != null && typeof r.title !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `provider web_search_call result ${index} title must be a string when provided`,
+      );
+    }
+    if (r.page_age != null && typeof r.page_age !== "string") {
+      throw new ChatGPTOAuthProtocolError(
+        `provider web_search_call result ${index} page_age must be a string when provided`,
+      );
+    }
+    const out: Record<string, unknown> = {
+      type: "web_search_result",
+      url: r.url,
+      title: typeof r.title === "string" ? r.title : r.url,
+      encrypted_content: typeof r.encrypted_content === "string" ? r.encrypted_content : "",
+    };
+    if (typeof r.page_age === "string") out.page_age = r.page_age;
+    return out;
+  });
 }
 
 function mergeUsageExtensions(
@@ -1425,6 +1860,7 @@ async function* renderAnthropicStreamEvents(
   let currentBlock: "thinking" | "text" | "tool_use" | null = null;
   let sawFinish = false;
   let hasToolCalls = false;
+  let webSearchRequests = 0;
   const thinkingDisabled = opts?.suppressReasoning === true;
   const thinkingOmitted = opts?.thinkingDisplay === "omitted";
   const suppressReasoning = thinkingDisabled || thinkingOmitted;
@@ -1700,9 +2136,70 @@ async function* renderAnthropicStreamEvents(
       blockIndex++;
       currentBlock = null;
     } else if (typ === "web_search_call") {
-      throw new ChatGPTOAuthProtocolError(
-        "provider web_search_call output cannot be represented losslessly by the Anthropic facade",
-      );
+      if (hasPendingReasoningDeltas) {
+        if (activeThinkingItemId !== undefined) {
+          throw new ChatGPTOAuthProtocolError(
+            "reasoning stream with item_id ended without matching reasoning_item",
+          );
+        }
+        hasPendingReasoningDeltas = false;
+        streamedThinkingParts.length = 0;
+      }
+      if (currentBlock !== null) {
+        yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+        blockIndex++;
+        currentBlock = null;
+      }
+      if (typeof event.id !== "string" || event.id.length === 0) {
+        throw new ChatGPTOAuthProtocolError("web_search_call event requires a non-empty string id");
+      }
+      let query: string | undefined;
+      if (typeof event.query === "string") {
+        query = event.query;
+      } else if (typeof event.input === "object" && event.input !== null && !Array.isArray(event.input)) {
+        const inputObj = event.input as Record<string, unknown>;
+        if (typeof inputObj.query === "string") {
+          query = inputObj.query;
+        }
+      }
+      if (query === undefined) {
+        throw new ChatGPTOAuthProtocolError("web_search_call event requires a string query");
+      }
+      const results = normalizeWebSearchResults(event.content);
+      webSearchRequests += 1;
+      yield sse("content_block_start", {
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: {
+          type: "server_tool_use",
+          id: event.id,
+          name: "web_search",
+          input: {},
+          caller: { type: "direct" },
+        },
+      });
+      yield sse("content_block_delta", {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify({ query }),
+        },
+      });
+      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+      blockIndex++;
+      yield sse("content_block_start", {
+        type: "content_block_start",
+        index: blockIndex,
+        content_block: {
+          type: "web_search_tool_result",
+          tool_use_id: event.id,
+          content: results,
+          caller: { type: "direct" },
+        },
+      });
+      yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+      blockIndex++;
     } else if (typ === "finish") {
       if (hasPendingReasoningDeltas) {
         if (activeThinkingItemId !== undefined) {
@@ -1722,6 +2219,12 @@ async function* renderAnthropicStreamEvents(
       sawFinish = true;
 
       const usage = usageFromProviderEvent(event.usage);
+      if (usage.server_tool_use == null && webSearchRequests > 0) {
+        usage.server_tool_use = {
+          web_search_requests: webSearchRequests,
+          web_fetch_requests: 0,
+        };
+      }
       yield sse("message_delta", {
         type: "message_delta",
         context_management: null,

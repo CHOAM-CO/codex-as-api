@@ -54,6 +54,8 @@ from codex_as_api.provider import (
     _web_search_event_from_response_item,
     codex_cli_headers_for_version,
     codex_session_headers,
+    normalize_native_responses_input,
+    normalize_native_responses_tools,
     resolve_codex_cli_version,
     resolve_model_reasoning_effort,
 )
@@ -2196,7 +2198,7 @@ def test_codex_cli_headers_include_official_originator_and_versioned_user_agent(
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.10.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/1.0.0")
 
 
 def test_codex_cli_headers_reject_unpinned_version():
@@ -2936,7 +2938,7 @@ def test_provider_headers_include_codex_cli_headers(auth_json_factory):
 
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"].startswith("codex_cli_rs/0.164.0 (")
-    assert headers["User-Agent"].endswith(") codex-as-api/0.10.2")
+    assert headers["User-Agent"].endswith(") codex-as-api/1.0.0")
     assert headers["Authorization"].startswith("Bearer ")
 
 
@@ -4100,7 +4102,6 @@ def test_web_search_event_from_response_item_action_sources():
             "id": "ws_1",
             "action": {"type": "search", "query": "q", "queries": "bad", "sources": []},
         },
-        {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "queries": ["a", "b"], "sources": []}},
         {
             "type": "web_search_call",
             "id": "ws_1",
@@ -4111,12 +4112,22 @@ def test_web_search_event_from_response_item_action_sources():
         {
             "type": "web_search_call",
             "id": "ws_1",
-            "action": {"type": "open_page", "url": "https://example.test", "sources": []},
+            "action": {"type": "open_page", "url": 123},
         },
         {
             "type": "web_search_call",
             "id": "ws_1",
-            "action": {"type": "find_in_page", "pattern": "needle", "sources": []},
+            "action": {"type": "open_page", "url": "https://example.test", "sources": "bad"},
+        },
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "find_in_page", "pattern": 123},
+        },
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "find_in_page", "pattern": "needle", "url": 123},
         },
         {"type": "web_search_call", "id": "ws_1", "action": {"type": "future", "sources": []}},
         {
@@ -4137,10 +4148,80 @@ def test_web_search_event_rejects_fallback_or_malformed_fields(item):
 
 
 @pytest.mark.parametrize(
+    ("action", "expected_query", "expected_content"),
+    [
+        (
+            {"type": "open_page", "url": "https://example.test"},
+            "open_page: https://example.test",
+            [],
+        ),
+        (
+            {"type": "open_page", "url": None, "sources": None},
+            "open_page",
+            [],
+        ),
+        (
+            {
+                "type": "open_page",
+                "url": "   ",
+                "sources": [{"url": "https://example.test", "title": "Example"}],
+            },
+            "open_page",
+            [{"type": "web_search_result", "url": "https://example.test", "title": "Example"}],
+        ),
+        (
+            {"type": "find_in_page", "pattern": "needle", "url": "https://example.test"},
+            "find_in_page: needle (https://example.test)",
+            [],
+        ),
+        (
+            {"type": "find_in_page", "pattern": "needle", "url": None, "sources": None},
+            "find_in_page: needle",
+            [],
+        ),
+        (
+            {"type": "find_in_page", "url": "https://example.test"},
+            "find_in_page: https://example.test",
+            [],
+        ),
+        (
+            {"type": "find_in_page", "pattern": "", "url": "   "},
+            "find_in_page",
+            [],
+        ),
+        (
+            {
+                "type": "find_in_page",
+                "pattern": "needle",
+                "sources": [{"url": "https://example.test", "page_age": "1d"}],
+            },
+            "find_in_page: needle",
+            [{"type": "web_search_result", "url": "https://example.test", "page_age": "1d"}],
+        ),
+    ],
+)
+def test_web_search_event_projects_open_page_and_find_in_page_actions(
+    action,
+    expected_query,
+    expected_content,
+):
+    event = _web_search_event_from_response_item(
+        {"type": "web_search_call", "id": "ws_page_1", "action": action}
+    )
+    assert event == {
+        "type": "web_search_call",
+        "id": "ws_page_1",
+        "input": {"query": expected_query},
+        "content": expected_content,
+    }
+
+
+@pytest.mark.parametrize(
     ("action", "expected"),
     [
         ({"query": "direct", "queries": None, "sources": []}, "direct"),
         ({"query": None, "queries": ["fallback"], "sources": []}, "fallback"),
+        ({"query": None, "queries": ["a", "b"], "sources": []}, "a | b"),
         ({"query": "", "sources": []}, ""),
         ({"query": "same", "queries": ["same"], "sources": []}, "same"),
     ],
@@ -4609,7 +4690,7 @@ def test_provider_injects_dynamic_npm_version_across_catalog_responses_and_401_r
     for full_url, headers in observed_requests:
         assert full_url == "https://example.test/codex/models?client_version=0.175.2"
         assert headers["user-agent"].startswith("codex_cli_rs/0.175.2 (")
-        assert headers["user-agent"].endswith(") codex-as-api/0.10.2")
+        assert headers["user-agent"].endswith(") codex-as-api/1.0.0")
 
 
 def test_provider_cold_version_resolver_failure_raises_typed_503(auth_json_factory, monkeypatch):
@@ -4816,3 +4897,193 @@ def test_responses_requests_carry_codex_session_headers_only_with_a_key(monkeypa
         assert headers["x-client-request-id"] == "cache-key-7"
     assert "session-id" not in seen[2][1]
     assert "thread-id" not in seen[2][1]
+
+
+def test_web_search_event_joins_multi_query_when_query_matches_queries():
+    event = _web_search_event_from_response_item(
+        {
+            "type": "web_search_call",
+            "id": "ws_multi",
+            "action": {
+                "type": "search",
+                "query": "alpha",
+                "queries": ["alpha", "beta"],
+                "sources": [],
+            },
+        }
+    )
+    assert event is not None
+    assert event["input"] == {"query": "alpha | beta"}
+
+    with pytest.raises(ChatGPTOAuthProtocolError, match="conflicts with queries"):
+        _web_search_event_from_response_item(
+            {
+                "type": "web_search_call",
+                "id": "ws_conflict",
+                "action": {
+                    "type": "search",
+                    "query": "gamma",
+                    "queries": ["alpha", "beta"],
+                    "sources": [],
+                },
+            }
+        )
+
+
+def test_normalize_native_responses_input_and_tools_parity():
+    assert normalize_native_responses_input([], target_model="gpt-5.6-sol", allow_empty=True) == []
+    with pytest.raises(ChatGPTOAuthInvalidRequestError):
+        normalize_native_responses_input([], target_model="gpt-5.6-sol", allow_empty=False)
+
+    normalized = normalize_native_responses_input(
+        [
+            {
+                "type": "reasoning",
+                "id": "rs_keep",
+                "model": "gpt-5.6-sol",
+                "encrypted_content": "enc_keep",
+                "summary": [{"type": "summary_text", "text": "keep"}],
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_drop",
+                "model": "gpt-5.5",
+                "encrypted_content": "enc_drop",
+                "summary": [],
+            },
+        ],
+        target_model="gpt-5.6-sol",
+    )
+    assert normalized == [
+        {
+            "type": "reasoning",
+            "id": "rs_keep",
+            "encrypted_content": "enc_keep",
+            "summary": [{"type": "summary_text", "text": "keep"}],
+        }
+    ]
+    with pytest.raises(ChatGPTOAuthInvalidRequestError, match="trimmed"):
+        normalize_native_responses_input(
+            [{"type": "reasoning", "id": "rs_bad", "model": " gpt-5.6-sol ", "encrypted_content": "enc"}]
+        )
+
+    assert normalize_native_responses_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "nested_fn",
+                    "description": "Nested",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                    "strict": True,
+                },
+            },
+            {"type": "web_search_preview", "search_context_size": "low"},
+            {"type": "web_search_preview_2025_03_11"},
+        ]
+    ) == [
+        {
+            "type": "function",
+            "name": "nested_fn",
+            "description": "Nested",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            "strict": True,
+        },
+        {"type": "web_search", "search_context_size": "low"},
+        {"type": "web_search"},
+    ]
+
+    for bad_tools in (
+        [{"type": "function", "function": "bad"}],
+        [{"type": "function", "name": "f", "parameters": "bad"}],
+        [{"type": "function", "name": "f", "strict": "yes"}],
+        [{"type": "code_interpreter"}],
+    ):
+        with pytest.raises(ChatGPTOAuthInvalidRequestError):
+            normalize_native_responses_tools(bad_tools)
+
+
+def test_compact_responses_retains_all_items_and_completed_output_fallback_chains(monkeypatch):
+    provider = ChatGPTOAuthProvider()
+    seen_payloads: list[dict[str, object]] = []
+    call_count = 0
+
+    def fake_post_sse(_path: str, payload: dict[str, object], extra_headers=None, catalog_key=None):
+        nonlocal call_count
+        del extra_headers, catalog_key
+        seen_payloads.append(deepcopy(payload))
+        call_count += 1
+        if call_count == 1:
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_completed_only",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "from completed output"}],
+                        }
+                    ],
+                },
+            }
+            return
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_continued",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "continued ok"}],
+                    }
+                ],
+            },
+        }
+
+    def fake_post_json(_path: str, payload: dict[str, object], extra_headers=None, catalog_key=None):
+        del extra_headers, catalog_key
+        seen_payloads.append(deepcopy(payload))
+        return {
+            "output": [
+                {"type": "additional_tools", "role": "developer", "tools": []},
+                {"type": "reasoning", "id": "rs_c1", "summary": [{"type": "summary_text", "text": "kept"}]},
+                {"type": "function_call", "call_id": "call_c1", "name": "lookup", "arguments": "{}"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_post_sse", fake_post_sse)
+    monkeypatch.setattr(provider, "_post_json", fake_post_json)
+
+    first = provider.create_response(model="gpt-5.5", input="Turn 1")
+    assert first["id"] == "resp_completed_only"
+
+    second = provider.create_response(
+        model="gpt-5.5",
+        input=[],
+        previous_response_id="resp_completed_only",
+    )
+    assert second["id"] == "resp_continued"
+    assert seen_payloads[1]["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1"}]},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "from completed output"}],
+        },
+    ]
+
+    compacted = provider.compact_responses(
+        model="gpt-5.5",
+        input=[],
+        previous_response_id="resp_continued",
+        reasoning_summary="concise",
+    )
+    assert len(compacted["output"]) == 4
+    assert seen_payloads[-1]["reasoning"]["summary"] == "concise"

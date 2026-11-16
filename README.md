@@ -9,7 +9,7 @@ Use ChatGPT / Codex OAuth as a local OpenAI-compatible API server.
 
 ## Features
 
-- **OpenAI & Anthropic compatible** — Chat Completions, Messages, and `GET /v1/models`
+- **OpenAI & Anthropic compatible** — Responses (`/v1/responses`, `/v1/responses/compact`), Chat Completions, Messages, and `GET /v1/models`
 - **Claude Code ready** — use Codex models directly from Claude Code CLI
 - **Streaming** — full SSE streaming for both OpenAI and Anthropic protocols
 - **Tool calling** — function calls, tool results, and parallel tool calls
@@ -357,7 +357,7 @@ it; continuation uses the complete provider Response items saved behind
 
 Anthropic Messages compatibility endpoint for any client, including Claude Code and Scheherazade. It supports streaming (`stream: true`) and non-streaming without a client-identification header. A live Codex model ID routes directly. A `claude-*` facade ID uses the configured Codex backend model, or the authenticated catalog default when no backend model is configured. Other unknown IDs fail. The response preserves the client-supplied model name.
 
-`max_tokens` is a required positive compatibility hint: the private Codex OAuth transport does not expose a matching output-token cap. Valid ephemeral `cache_control` hints are accepted and stripped for every client; their TTL and breakpoint semantics are not forwarded. An optional `x-claude-code-session-id` provides stable hashed cache affinity, not permission to use the endpoint. `metadata.user_id` is accepted as client metadata and is not forwarded.
+`max_tokens` is a required positive compatibility hint: the private Codex OAuth transport does not expose a matching output-token cap. Valid ephemeral `cache_control` hints are accepted and stripped for every client; their TTL and breakpoint semantics are not forwarded. An optional `x-claude-code-session-id` provides stable hashed cache affinity, not permission to use the endpoint. Anthropic `metadata` objects with string or null entries (including `user_id` and additional client metadata keys) are accepted and not forwarded.
 
 ```bash
 curl http://localhost:18080/v1/messages \
@@ -400,12 +400,21 @@ On the following assistant-history request, recognized envelopes restore the ori
 
 Multiple summary parts share one thinking block per reasoning item. Encrypted-only items use an empty thinking string with a non-empty signature. Streaming sends `signature_delta` before the matching `content_block_stop`. `display: "omitted"` hides the summary but can preserve an encrypted-only signed block for continuity; disabled thinking suppresses thinking output. Items without encrypted content retain unsigned-summary compatibility behavior.
 
-Hosted Anthropic `web_search` declarations are rejected with HTTP 400 on
-Messages, token-counting, and compact requests. OpenAI Responses cannot supply
-the Anthropic server-tool provenance and encrypted lifecycle fields required to
-translate a hosted result losslessly, so the gateway does not approximate that
-protocol. Provider output containing an unexpected hosted web-search call is an
-upstream protocol error instead of a fabricated Anthropic result block.
+Hosted Anthropic `web_search` declarations (`web_search`, `web_search_20250305`,
+and `web_search_20260209`, including `allowed_domains`, `user_location`,
+`tool_choice: {"type": "tool", "name": "web_search"}`, and positive integer
+`max_uses`, which is validated and accepted for Anthropic compatibility without
+upstream enforcement) are supported when Classic Responses is active
+(`responses_lite: false`, or `"auto"` on models that use Classic Responses) and
+map to Codex hosted `web_search` with `web_search_call.action.sources`,
+projecting `search`, `open_page`, and `find_in_page` `web_search_call` actions into
+`server_tool_use` and `web_search_tool_result` blocks alongside
+`usage.server_tool_use` (and preserving the raw `web_search_call` items on `/v1/responses`).
+`blocked_domains` and `strict: true` on `web_search`,
+or hosted `web_search` when Responses Lite is active, return HTTP 400. Replayed
+`server_tool_use`, `web_search_tool_result`, text/content `document`, and
+`search_result` blocks in conversation history are rendered into structured
+text context.
 
 Completed responses require authoritative final token usage and a real
 `response.completed` event. Emitted function calls map to `tool_calls` or
@@ -477,7 +486,7 @@ curl http://localhost:18080/v1/messages/count_tokens \
 
 ### `POST /v1/messages/compact`
 
-Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content. Live GPT model IDs select the matching backend model, and Claude Code effort and Fast Mode controls use the same mappings as `/v1/messages`. Its required non-forwarded `max_tokens` and any valid `cache_control` hints are accepted for every client; the optional Claude Code session header only supplies cache affinity.
+Anthropic-compatible alias for remote conversation compaction. Accepts Anthropic Messages-shaped bodies and returns compacted checkpoint content. Live GPT model IDs select the matching backend model, and Claude Code effort and Fast Mode controls use the same mappings as `/v1/messages`. Its optional non-forwarded `max_tokens` (validated as a positive integer when provided), sampling/stop compatibility fields (`temperature`, `top_p`, `top_k`, empty `stop_sequences: []`), `tool_choice`, and valid `cache_control` hints are accepted for every client; the optional Claude Code session header only supplies cache affinity.
 
 ### `POST /v1/images/generations`
 
@@ -626,7 +635,7 @@ Requests can instead use the Responses-shaped effort/context object:
 - Responses Lite uses `all_turns` as the Codex wire default. An explicitly different context is rejected instead of silently overwritten; use `responses_lite: false` when the backend route supports classic Responses and another context is required.
 - Remote compact keeps its existing private Codex `reasoning_effort` field but does not accept public `reasoning.mode` or `reasoning.context`.
 
-Anthropic `thinking` values map as `enabled → high` and `adaptive → medium`. Disabled thinking selects `none` when available, otherwise the lowest supported catalog effort, and suppresses reasoning output; it does not claim to eliminate a model's internal reasoning. `output_config.effort` takes precedence over adaptive or enabled thinking and supports `low`, `medium`, `high`, `xhigh`, and `max`. Call-level disabled thinking takes precedence over ambient `output_config.effort` for auxiliary calls such as WebFetch. Explicit unsupported effort requests still fail. Hosted Anthropic WebSearch is rejected because its lifecycle cannot be translated losslessly. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro, non-null public cache policy/breakpoints, and any supplied `safety_identifier` fail explicitly on the private Codex provider.
+Anthropic `thinking` values map as `enabled → high` and `adaptive → medium`. Disabled thinking selects `none` when available, otherwise the lowest supported catalog effort, and suppresses reasoning output; it does not claim to eliminate a model's internal reasoning. `output_config.effort` takes precedence over adaptive or enabled thinking and supports `low`, `medium`, `high`, `xhigh`, and `max`. Call-level disabled thinking takes precedence over ambient `output_config.effort` for auxiliary calls such as WebFetch. Explicit unsupported effort requests still fail. Hosted Anthropic `web_search` declarations are bridged when Classic Responses is active (`responses_lite: false`, or `"auto"` on Classic-default models), while Responses Lite rejects hosted `web_search` with HTTP 400. The supported reasoning context and verbosity extensions are also available on `/v1/messages`, image generation, and inspection requests; Pro, non-null public cache policy/breakpoints, and any supplied `safety_identifier` fail explicitly on the private Codex provider.
 
 Anthropic's `JSONOutputFormat` carries a schema but no name. When Claude Code
 sends that official shape, the proxy follows pinned Codex 0.153.3 and supplies
@@ -635,10 +644,11 @@ or fallback role. An explicit proxy-extension name is preserved only when it is
 already a valid Responses format name, and is never sanitized or truncated.
 
 The pinned official Codex HTTP request has no `stop` field. Omitted OpenAI
-`stop`, or explicit OpenAI `stop: null`, is omitted from the private request;
-any other OpenAI `stop` value returns HTTP 400. Anthropic `stop_sequences`
-follows its typed API contract: omission is allowed, while explicit `null` or
-an array value returns HTTP 400 because the private transport cannot apply it.
+`stop`, explicit `stop: null`, and empty `stop: []` are omitted from the private
+request as no-ops; any non-empty OpenAI `stop` value returns HTTP 400. Anthropic
+`stop_sequences` allows omission and empty `stop_sequences: []`, while explicit
+`stop_sequences: null` or any non-empty array returns HTTP 400 because the
+private transport cannot apply stop sequences.
 
 The mapping is intentionally transport-aware:
 
@@ -648,7 +658,7 @@ The mapping is intentionally transport-aware:
 | `prompt_cache_key` | Forward an explicit value; otherwise use non-empty `client_metadata.session_id` |
 | Non-null `prompt_cache_options` / breakpoint | HTTP 400; `null` is omitted and there is no private field |
 | Any supplied `safety_identifier` | HTTP 400; the optional field is non-nullable and OAuth account/thread IDs are not semantic aliases |
-| Non-null `stop` / `stop_sequences` | HTTP 400; no private field |
+| Non-empty `stop` / `stop_sequences` (or `stop_sequences: null`) | HTTP 400; empty `[]` (and OpenAI `stop: null`) are omitted |
 | `previous_response_id` | Resolve locally and replay complete Response history over HTTP |
 | `service_tier: "fast"` | Send `service_tier: "priority"` |
 | `service_tier: "default"` | Omit the field |
@@ -859,12 +869,15 @@ CODEX_AS_API_MODEL=gpt-5.6-terra \
 codex-as-api
 ```
 
-Claude Code hosted WebSearch is not supported through this gateway, regardless
-of Responses Lite mode. Classic Responses can execute an OpenAI hosted search,
-but its output lacks the Anthropic provenance and encrypted lifecycle data
-needed for a lossless Messages response. WebFetch remains a client-side
-auxiliary request and retains the disabled-thinking precedence behavior when
-process-level effort is enabled.
+Claude Code hosted `web_search` (`web_search`, `web_search_20250305`, and
+`web_search_20260209`) is supported when Classic Responses is active
+(`responses_lite: false`, or `"auto"` on models whose catalog sets Classic
+Responses), mapping Codex `web_search` calls and `web_search_call.action.sources`
+into Anthropic `server_tool_use` and `web_search_tool_result` blocks alongside
+`usage.server_tool_use`. On Responses Lite models under `responses_lite: "auto"`,
+hosted `web_search` returns HTTP 400 unless `responses_lite: false` is valid
+and supplied. WebFetch remains a client-side auxiliary request and retains the
+disabled-thinking precedence behavior when process-level effort is enabled.
 
 To keep the built-in Fable, Opus, Sonnet, and Haiku rows and append one GPT row, launch the GPT-routed Claude Code process with these variables:
 
@@ -973,9 +986,9 @@ registry setup is still required:
 After bumping every version and passing the local gate, push the matching tag:
 
 ```bash
-python scripts/check_package_versions.py --tag v0.10.2
-git tag v0.10.2
-git push origin v0.10.2
+python scripts/check_package_versions.py --tag v1.0.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ## Tests

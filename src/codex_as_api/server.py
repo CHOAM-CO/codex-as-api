@@ -142,9 +142,12 @@ _ANTHROPIC_COUNT_TOKENS_FIELDS = frozenset(
         "programmatic_tool_calling",
         "stop_sequences",
         "system",
+        "temperature",
         "thinking",
         "tool_choice",
         "tools",
+        "top_k",
+        "top_p",
     }
 )
 _INSPECT_FIELDS = frozenset(
@@ -184,13 +187,71 @@ _OPENAI_COMPACT_FIELDS = frozenset(
         "verbosity",
     }
 )
+_OPENAI_RESPONSES_FIELDS = frozenset(
+    {
+        "client_metadata",
+        "codex_metadata",
+        "include",
+        "input",
+        "instructions",
+        "memgen_request",
+        "metadata",
+        "model",
+        "multi_agent",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "programmatic_tool_calling",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "reasoning",
+        "reasoning_effort",
+        "responses_lite",
+        "safety_identifier",
+        "service_tier",
+        "store",
+        "stream",
+        "stream_options",
+        "subagent",
+        "text",
+        "tool_choice",
+        "tools",
+        "user",
+        "verbosity",
+    }
+)
+_OPENAI_RESPONSES_COMPACT_FIELDS = frozenset(
+    {
+        "include",
+        "input",
+        "instructions",
+        "model",
+        "multi_agent",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "programmatic_tool_calling",
+        "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "reasoning",
+        "reasoning_effort",
+        "responses_lite",
+        "safety_identifier",
+        "service_tier",
+        "text",
+        "tools",
+        "verbosity",
+    }
+)
 _ANTHROPIC_COMPACT_FIELDS = frozenset(
     (
         set(_ANTHROPIC_MESSAGES_FIELDS)
         | {
             "include",
             "prompt_cache_retention",
+            "temperature",
             "text",
+            "top_k",
+            "top_p",
         }
     )
     - {"stream", "subagent", "memgen_request"}
@@ -471,7 +532,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="0.10.2",
+    version="1.0.0",
 )
 
 
@@ -1433,6 +1494,8 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
         return None
     if isinstance(stop, str):
         return [stop]
+    if isinstance(stop, list) and not stop:
+        return None
     return list(stop)
 
 
@@ -1442,7 +1505,61 @@ def _max_tokens_from_request(req: ChatCompletionRequest) -> int | None:
     return req.max_tokens
 
 
+def _validate_store_option(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, bool):
+        raise ChatGPTOAuthInvalidRequestError("store must be a boolean")
+    if value is True:
+        raise ChatGPTOAuthInvalidRequestError(
+            "store=true is not supported by the ChatGPT Codex OAuth transport"
+        )
+
+
+def _validate_stream_options(value: object, *, stream: bool) -> bool | None:
+    if value is None:
+        return None
+    if not stream:
+        raise ChatGPTOAuthInvalidRequestError("stream_options is only valid when stream=true")
+    if not isinstance(value, dict):
+        raise ChatGPTOAuthInvalidRequestError("stream_options must be an object")
+    unknown = sorted(set(value) - {"include_usage"})
+    if unknown:
+        raise ChatGPTOAuthInvalidRequestError(
+            "stream_options contains unsupported fields: " + ", ".join(unknown)
+        )
+    if "include_usage" in value and value["include_usage"] is not None and not isinstance(value["include_usage"], bool):
+        raise ChatGPTOAuthInvalidRequestError("stream_options.include_usage must be a boolean")
+    return cast(bool | None, value.get("include_usage"))
+
+
+def _validate_anthropic_sampling_hints(body: dict[str, Any]) -> None:
+    import math
+
+    for field in ("temperature", "top_p"):
+        if field not in body:
+            continue
+        value = body[field]
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or value > 1
+        ):
+            raise ChatGPTOAuthInvalidRequestError(f"{field} must be a number between 0 and 1")
+    if "top_k" in body:
+        parsed = as_js_safe_integer(body["top_k"])
+        if parsed is None or parsed <= 0:
+            raise ChatGPTOAuthInvalidRequestError("top_k must be a positive integer")
+
+
 def _reject_unmapped_openai_controls(request: ChatCompletionRequest) -> None:
+    _validate_store_option(request.store)
+    _validate_stream_options(request.stream_options, stream=bool(request.stream))
+    if request.user is not None and not request.user.strip():
+        raise ChatGPTOAuthInvalidRequestError("user must be a non-empty string")
     controls = {
         "audio": request.audio,
         "function_call": request.function_call,
@@ -1456,8 +1573,6 @@ def _reject_unmapped_openai_controls(request: ChatCompletionRequest) -> None:
         "prompt_cache_retention": request.prompt_cache_retention,
         "response_format": request.response_format,
         "seed": request.seed,
-        "store": request.store,
-        "stream_options": request.stream_options,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
         "max_completion_tokens": request.max_completion_tokens,
@@ -1465,7 +1580,6 @@ def _reject_unmapped_openai_controls(request: ChatCompletionRequest) -> None:
         "top_p": request.top_p,
         "frequency_penalty": request.frequency_penalty,
         "presence_penalty": request.presence_penalty,
-        "user": request.user,
         "web_search_options": request.web_search_options,
     }
     unsupported = [name for name, value in controls.items() if value is not None]
@@ -1480,6 +1594,8 @@ def _reject_explicit_null_fields(request: BaseModel, fields: tuple[str, ...]) ->
 
 
 def _reject_unmapped_image_controls(request: ImageGenerationRequest) -> None:
+    if request.user is not None and not request.user.strip():
+        raise ChatGPTOAuthInvalidRequestError("user must be a non-empty string")
     controls = {
         "background": request.background,
         "moderation": request.moderation,
@@ -1491,7 +1607,6 @@ def _reject_unmapped_image_controls(request: ImageGenerationRequest) -> None:
         "response_format": request.response_format,
         "stream": request.stream,
         "style": request.style,
-        "user": request.user,
     }
     unsupported = [name for name, value in controls.items() if value is not None]
     if unsupported:
@@ -1603,11 +1718,12 @@ def _messages_from_compact_body(
     if anthropic or any(key in body for key in ("system", "thinking", "tool_choice", "stop_sequences")):
         _strip_anthropic_cache_controls(body)
         _validate_anthropic_context_management(body.get("context_management"))
+        _validate_anthropic_sampling_hints(body)
         anthropic_model = body.get("model")
         if not isinstance(anthropic_model, str) or not anthropic_model:
             raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string")
         anthropic_messages = cast(list[dict[str, Any]], messages_value)
-        max_tokens = _positive_integer_field(body, "max_tokens", required=True)
+        max_tokens = _positive_integer_field(body, "max_tokens", required=False)
         raw_tools = body.get("tools")
         if raw_tools is not None and not isinstance(raw_tools, list):
             raise ChatGPTOAuthInvalidRequestError("tools must be an array")
@@ -1615,15 +1731,11 @@ def _messages_from_compact_body(
         if raw_tool_choice is not None and not isinstance(raw_tool_choice, dict):
             raise ChatGPTOAuthInvalidRequestError("tool_choice must be an object")
         raw_stop = body.get("stop_sequences")
-        if raw_stop is not None:
-            raise ChatGPTOAuthInvalidRequestError(
-                "stop_sequences is not supported by the private Codex OAuth compact transport"
-            )
         raw_thinking = body.get("thinking")
         if raw_thinking is not None and not isinstance(raw_thinking, dict):
             raise ChatGPTOAuthInvalidRequestError("thinking must be an object")
         try:
-            messages, tools, converted_tool_choice, _stop, reasoning_effort, text = anthropic_request_to_internal(
+            messages, tools, _converted_tool_choice, _stop, reasoning_effort, text = anthropic_request_to_internal(
                 model=anthropic_model,
                 messages=anthropic_messages,
                 system=body.get("system"),
@@ -1642,8 +1754,6 @@ def _messages_from_compact_body(
             )
         except ValueError as exc:
             raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
-        if converted_tool_choice is not None and converted_tool_choice != "auto":
-            raise ChatGPTOAuthInvalidRequestError("compact supports only Anthropic tool_choice.type=auto")
         return messages, tools, reasoning_effort, text, reasoning_summary, thinking_disabled
 
     try:
@@ -1863,6 +1973,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
     if "responses_lite" in request.model_fields_set and request.responses_lite is None:
         raise ChatGPTOAuthInvalidRequestError("responses_lite must be a boolean or string when provided")
     _reject_unmapped_openai_controls(request)
+    include_usage = _validate_stream_options(request.stream_options, stream=bool(request.stream))
     _reject_unsupported_generation_features(
         {
             field: getattr(request, field)
@@ -2103,7 +2214,7 @@ async def chat_completions(request: ChatCompletionRequest, http_request: Request
                     yield f"data: {json.dumps(chunk)}\n\n"
 
             # Usage summary chunk if available
-            if usage_dict is not None:
+            if usage_dict is not None and include_usage is not False:
                 u = usage_dict
                 prompt_tokens = cast(int, u["input_tokens"])
                 completion_tokens = cast(int, u["output_tokens"])
@@ -2318,8 +2429,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
     try:
         _strip_anthropic_cache_controls(body)
         _validate_anthropic_context_management(body.get("context_management"))
-        if body.get("stop_sequences") is not None:
-            raise ChatGPTOAuthInvalidRequestError("stop_sequences is not supported by the Anthropic token count facade")
+        _validate_anthropic_sampling_hints(body)
         messages, tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
             model=body.get("model"),
             messages=body.get("messages"),
@@ -2727,11 +2837,9 @@ async def compact(request: Request) -> JSONResponse:
         thinking_disabled,
     ) = _messages_from_compact_body(body, anthropic=is_anthropic_compact)
     if is_anthropic_compact:
-        compact_parallel_tool_calls = anthropic_parallel_tool_calls(
+        anthropic_parallel_tool_calls(
             cast(dict[str, Any] | None, body.get("tool_choice"))
         )
-        if compact_parallel_tool_calls is True:
-            raise ChatGPTOAuthInvalidRequestError("messages compact cannot preserve disable_parallel_tool_use=false")
     nested_reasoning = body.get("reasoning")
     nested_effort: object = None
     if nested_reasoning is not None:
@@ -2817,6 +2925,277 @@ async def compact(request: Request) -> JSONResponse:
     return JSONResponse(
         content={"checkpoint": checkpoint},
     )
+
+
+def _parse_responses_tool_choice(value: object) -> str | dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value not in {"auto", "none", "required"}:
+            raise ChatGPTOAuthInvalidRequestError(
+                "tool_choice must be one of: auto, none, required, or a tool choice object"
+            )
+        return value
+    if not isinstance(value, dict):
+        raise ChatGPTOAuthInvalidRequestError("tool_choice must be a string or object")
+    if value.get("type") == "function":
+        if isinstance(value.get("name"), str) and value["name"]:
+            return {"type": "function", "name": value["name"]}
+        func = value.get("function")
+        if isinstance(func, dict) and isinstance(func.get("name"), str) and func["name"]:
+            return {"type": "function", "name": func["name"]}
+        raise ChatGPTOAuthInvalidRequestError("tool_choice function requires a non-empty name")
+    if value.get("type") in {"web_search", "web_search_preview"}:
+        return {"type": "web_search"}
+    raise ChatGPTOAuthInvalidRequestError("tool_choice.type must be function or web_search")
+
+
+def _extract_responses_reasoning_summary(reasoning: object) -> tuple[object, str | None]:
+    if reasoning is None:
+        return None, None
+    if not isinstance(reasoning, dict):
+        raise ChatGPTOAuthInvalidRequestError("reasoning must be an object")
+    summary = reasoning.get("summary")
+    if summary is not None and (not isinstance(summary, str) or summary not in {"auto", "concise", "detailed", "none"}):
+        raise ChatGPTOAuthInvalidRequestError(
+            "reasoning.summary must be one of: auto, concise, detailed, none"
+        )
+    rest = {k: v for k, v in reasoning.items() if k != "summary"}
+    return (rest if rest else None), cast(str | None, summary)
+
+
+@app.post("/v1/responses", response_model=None)
+async def openai_responses(http_request: Request) -> JSONResponse | StreamingResponse:
+    provider = _get_provider()
+    body = await _request_json_object(http_request)
+    _reject_explicit_null_responses_lite(body)
+    _reject_unknown_fields(body, _OPENAI_RESPONSES_FIELDS)
+    for field in (
+        "model",
+        "input",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "safety_identifier",
+        "user",
+        "multi_agent",
+        "programmatic_tool_calling",
+    ):
+        if field in body and body[field] is None:
+            raise ChatGPTOAuthInvalidRequestError(f"{field} must not be null")
+    if "input" not in body:
+        raise ChatGPTOAuthInvalidRequestError("input is required")
+    _validate_store_option(body.get("store"))
+    stream = body.get("stream", False)
+    if not isinstance(stream, bool):
+        raise ChatGPTOAuthInvalidRequestError("stream must be a boolean")
+    _validate_stream_options(body.get("stream_options"), stream=stream)
+    if body.get("user") is not None and (not isinstance(body["user"], str) or not body["user"].strip()):
+        raise ChatGPTOAuthInvalidRequestError("user must be a non-empty string")
+    if "multi_agent" in body or "programmatic_tool_calling" in body or "safety_identifier" in body:
+        _reject_unsupported_generation_features(
+            {
+                k: body[k]
+                for k in ("multi_agent", "programmatic_tool_calling", "safety_identifier")
+                if k in body
+            }
+        )
+    for str_field in (
+        "instructions",
+        "prompt_cache_key",
+        "previous_response_id",
+        "service_tier",
+        "verbosity",
+    ):
+        val = body.get(str_field)
+        if val is not None and not isinstance(val, str):
+            raise ChatGPTOAuthInvalidRequestError(f"{str_field} must be a string when provided")
+    parallel_tool_calls = body.get("parallel_tool_calls")
+    if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+        raise ChatGPTOAuthInvalidRequestError("parallel_tool_calls must be a boolean")
+    codex_metadata = body.get("codex_metadata")
+    if codex_metadata is not None and not isinstance(codex_metadata, bool):
+        raise ChatGPTOAuthInvalidRequestError("codex_metadata must be a boolean")
+    for dict_field in ("text", "prompt_cache_options"):
+        val = body.get(dict_field)
+        if val is not None and not isinstance(val, dict):
+            raise ChatGPTOAuthInvalidRequestError(f"{dict_field} must be an object when provided")
+    client_metadata = body.get("client_metadata")
+    if client_metadata is not None and (
+        not isinstance(client_metadata, dict)
+        or any(not isinstance(k, str) or not isinstance(v, str) for k, v in client_metadata.items())
+    ):
+        raise ChatGPTOAuthInvalidRequestError("client_metadata must be an object mapping strings to strings")
+    subagent = _resolve_subagent(
+        body.get("subagent"),
+        http_request.headers.get("x-openai-subagent"),
+    )
+    memgen_request = _resolve_memgen_request(
+        body.get("memgen_request"),
+        http_request.headers.get("x-openai-memgen-request"),
+    )
+    cleaned_reasoning, reasoning_summary = _extract_responses_reasoning_summary(body.get("reasoning"))
+    legacy_effort = body.get("reasoning_effort")
+    if legacy_effort is not None and not isinstance(legacy_effort, str):
+        raise ChatGPTOAuthInvalidRequestError("reasoning_effort must be a non-empty string when provided")
+    reasoning_effort, reasoning_mode, reasoning_context = _reasoning_fields(
+        cast(str | None, legacy_effort),
+        cleaned_reasoning,
+    )
+    requested_model = body.get("model")
+    if requested_model is not None and not isinstance(requested_model, str):
+        raise ChatGPTOAuthInvalidRequestError("model must be a string")
+    resolved_model = await run_in_threadpool(provider.resolve_model, requested_model)
+    nested_effort = cleaned_reasoning.get("effort") if isinstance(cleaned_reasoning, dict) else None
+    _validate_configured_reasoning_effort(
+        resolved_model[1],
+        reasoning_effort,
+        request_has_effort=legacy_effort is not None or nested_effort is not None,
+    )
+    tool_choice = _parse_responses_tool_choice(body.get("tool_choice"))
+    raw_tools = body.get("tools")
+    if raw_tools is not None and not isinstance(raw_tools, list):
+        raise ChatGPTOAuthInvalidRequestError("tools must be an array")
+    raw_include = body.get("include")
+    if raw_include is not None and (
+        not isinstance(raw_include, list) or any(not isinstance(item, str) or not item.strip() for item in raw_include)
+    ):
+        raise ChatGPTOAuthInvalidRequestError("include must be an array of non-empty strings")
+    options: dict[str, Any] = {
+        "model": resolved_model[1].slug,
+        "input": body.get("input"),
+        "instructions": body.get("instructions"),
+        "tools": raw_tools,
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+        "reasoning_effort": reasoning_effort,
+        "reasoning_mode": reasoning_mode,
+        "reasoning_context": reasoning_context,
+        "reasoning_summary": reasoning_summary,
+        "prompt_cache_key": body.get("prompt_cache_key"),
+        "subagent": subagent,
+        "memgen_request": memgen_request,
+        "previous_response_id": body.get("previous_response_id"),
+        "service_tier": body.get("service_tier"),
+        "text": body.get("text"),
+        "client_metadata": client_metadata,
+        "codex_metadata": codex_metadata,
+        "responses_lite": body.get("responses_lite"),
+        "safety_identifier": body.get("safety_identifier"),
+        "prompt_cache_options": body.get("prompt_cache_options"),
+        "verbosity": body.get("verbosity"),
+        "include": raw_include,
+        "_resolved_model": resolved_model,
+    }
+    prepared = await run_in_threadpool(lambda: provider._native_responses_payload(**options))
+    if stream:
+
+        def _stream() -> Iterator[str]:
+            try:
+                for event in provider._stream_responses_payload(prepared):
+                    event_type = event.get("type") if isinstance(event.get("type"), str) else "message"
+                    yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:  # noqa: BLE001
+                error_type = _error_type(exc)
+                error = {
+                    "type": "error",
+                    "error": {
+                        "message": _public_error_message(exc),
+                        "type": error_type,
+                        "code": error_type,
+                    },
+                }
+                yield f"event: error\ndata: {json.dumps(error, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    response_obj = await run_in_threadpool(lambda: provider.create_response(**options))
+    return JSONResponse(content=response_obj)
+
+
+@app.post("/v1/responses/compact")
+async def openai_responses_compact(http_request: Request) -> JSONResponse:
+    provider = _get_provider()
+    body = await _request_json_object(http_request)
+    _reject_explicit_null_responses_lite(body)
+    _reject_unknown_fields(body, _OPENAI_RESPONSES_COMPACT_FIELDS)
+    for field in ("model", "input", "tools", "parallel_tool_calls", "prompt_cache_key"):
+        if field in body and body[field] is None:
+            raise ChatGPTOAuthInvalidRequestError(f"{field} must not be null")
+    if "input" not in body:
+        raise ChatGPTOAuthInvalidRequestError("input is required")
+    if "multi_agent" in body or "programmatic_tool_calling" in body or "safety_identifier" in body:
+        _reject_unsupported_generation_features(
+            {
+                k: body[k]
+                for k in ("multi_agent", "programmatic_tool_calling", "safety_identifier")
+                if k in body
+            }
+        )
+    for field in ("safety_identifier", "include", "prompt_cache_retention"):
+        if body.get(field) is not None:
+            raise ChatGPTOAuthInvalidRequestError(f"{field} is not supported by the compact facade")
+    for str_field in (
+        "instructions",
+        "prompt_cache_key",
+        "previous_response_id",
+        "service_tier",
+        "verbosity",
+    ):
+        val = body.get(str_field)
+        if val is not None and not isinstance(val, str):
+            raise ChatGPTOAuthInvalidRequestError(f"{str_field} must be a string when provided")
+    parallel_tool_calls = body.get("parallel_tool_calls")
+    if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+        raise ChatGPTOAuthInvalidRequestError("parallel_tool_calls must be a boolean")
+    for dict_field in ("text", "prompt_cache_options"):
+        val = body.get(dict_field)
+        if val is not None and not isinstance(val, dict):
+            raise ChatGPTOAuthInvalidRequestError(f"{dict_field} must be an object when provided")
+    cleaned_reasoning, reasoning_summary = _extract_responses_reasoning_summary(body.get("reasoning"))
+    legacy_effort = body.get("reasoning_effort")
+    if legacy_effort is not None and not isinstance(legacy_effort, str):
+        raise ChatGPTOAuthInvalidRequestError("reasoning_effort must be a non-empty string when provided")
+    reasoning_effort, reasoning_mode, reasoning_context = _reasoning_fields(
+        cast(str | None, legacy_effort),
+        cleaned_reasoning,
+    )
+    requested_model = body.get("model")
+    if requested_model is not None and not isinstance(requested_model, str):
+        raise ChatGPTOAuthInvalidRequestError("model must be a string")
+    resolved_model = await run_in_threadpool(provider.resolve_model, requested_model)
+    nested_effort = cleaned_reasoning.get("effort") if isinstance(cleaned_reasoning, dict) else None
+    _validate_configured_reasoning_effort(
+        resolved_model[1],
+        reasoning_effort,
+        request_has_effort=legacy_effort is not None or nested_effort is not None,
+    )
+    raw_tools = body.get("tools")
+    if raw_tools is not None and not isinstance(raw_tools, list):
+        raise ChatGPTOAuthInvalidRequestError("tools must be an array")
+    compacted = await run_in_threadpool(
+        lambda: provider.compact_responses(
+            model=resolved_model[1].slug,
+            input=body.get("input"),
+            instructions=body.get("instructions"),
+            tools=raw_tools,
+            parallel_tool_calls=body.get("parallel_tool_calls"),
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            responses_lite=body.get("responses_lite"),
+            previous_response_id=body.get("previous_response_id"),
+            prompt_cache_key=body.get("prompt_cache_key"),
+            prompt_cache_options=body.get("prompt_cache_options"),
+            service_tier=body.get("service_tier"),
+            text=body.get("text"),
+            verbosity=body.get("verbosity"),
+            _resolved_model=resolved_model,
+        )
+    )
+    return JSONResponse(content=compacted)
 
 
 # ------------------------------------------------------------------

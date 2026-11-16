@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.0.0
+
+### Native OpenAI Responses HTTP endpoints, hosted Anthropic WebSearch bridge, and SDK default compatibility across Python, TypeScript, and Rust
+
+- Add native OpenAI Responses HTTP endpoints (`POST /v1/responses` for streaming and non-streaming responses and `POST /v1/responses/compact` for remote compaction) across Python, TypeScript, and Rust (`create_response`/`create_responses_stream`/`compact_responses`, `createResponse`/`createResponsesStream`/`compactResponses`, and `create_native_response`/`stream_prepared_native_responses`/`compact_native_responses` on `ChatGPTOAuthProvider`), including local `previous_response_id` chain replay/commit (including `input: []` continuations), `reasoning.summary` (`auto`, `concise`, `detailed`, `none`), `subagent`/`memgen_request` headers, function and hosted `web_search` tool normalization, and synthesized `output_text`.
+- Bridge hosted Anthropic `web_search` tools (`web_search`, `web_search_20250305`, `web_search_20260209`, including `allowed_domains`, `user_location`, `tool_choice: {"type": "tool", "name": "web_search"}`, and positive integer `max_uses` validated and accepted for Anthropic compatibility without upstream enforcement) on Classic Responses (`responses_lite: false` or `"auto"` when the selected model uses Classic Responses) to Codex hosted `web_search` with `include: ["web_search_call.action.sources"]`, and map upstream `web_search_call` items (`search` including multi-query `action.queries`, `open_page`, and `find_in_page` actions) into Anthropic `server_tool_use` and `web_search_tool_result` blocks plus `usage.server_tool_use` while preserving raw `web_search_call` items on `/v1/responses`.
+- Accept replayed Anthropic `document` (plain-text/content sources), `search_result`, `server_tool_use`, and `web_search_tool_result` content blocks in user, assistant, and `tool_result` message history by rendering structured text representations instead of rejecting multi-turn conversations.
+- Accept standard SDK default/no-op controls that match Codex OAuth behavior: empty `stop: []` and `stop_sequences: []`, `store: false`, `user` metadata on `/v1/chat/completions` and `/v1/images/generations`, `stream_options: {"include_usage": true | false | null}` on streaming endpoints (and `stream_options: null`), Anthropic `metadata` objects with arbitrary string or `null` entries, and `citations: []` or `{"enabled": false}` on Anthropic content blocks.
+- Accept full Anthropic `MessageCreateParams` envelopes on `POST /v1/messages/count_tokens` and `POST /v1/messages/compact` (`temperature`, `top_p`, `top_k`, `stop_sequences`, all valid `tool_choice` variants, and optional `max_tokens` on `/v1/messages/compact`) so callers can pass their existing request payload directly.
+
 ## v0.10.2
 
 ### Realtime call & sideband deadlines and cross-runtime parity fixes

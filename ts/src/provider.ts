@@ -282,13 +282,15 @@ function tryClientVersionFromCatalogKey(key: string): string | undefined {
   return fields[2];
 }
 
+export type ReasoningSummaryOption = "auto" | "concise" | "detailed" | "none";
+
 export interface ChatOptions {
   model?: string;
   tools?: ToolSchema[];
   toolChoice?: string | Record<string, unknown>;
   temperature?: number;
   reasoningEffort?: string;
-  reasoningSummary?: "auto" | "none";
+  reasoningSummary?: ReasoningSummaryOption;
   reasoning?: ReasoningOptions;
   maxTokens?: number;
   stop?: string | string[];
@@ -307,6 +309,51 @@ export interface ChatOptions {
   ignoreMaxTokens?: boolean;
   preparedModel?: PreparedModel;
   signal?: AbortSignal;
+}
+
+export interface ResponsesRequestOptions {
+  model?: string;
+  input: string | Record<string, unknown>[];
+  instructions?: string;
+  tools?: Record<string, unknown>[];
+  toolChoice?: string | Record<string, unknown>;
+  parallelToolCalls?: boolean;
+  reasoningEffort?: string;
+  reasoningSummary?: ReasoningSummaryOption;
+  reasoning?: ReasoningOptions;
+  include?: string[];
+  promptCacheKey?: string;
+  promptCacheOptions?: PromptCacheOptions;
+  safetyIdentifier?: string;
+  subagent?: string;
+  memgenRequest?: boolean;
+  previousResponseId?: string;
+  serviceTier?: string;
+  text?: Record<string, unknown>;
+  clientMetadata?: Record<string, unknown>;
+  codexMetadata?: boolean;
+  responsesLite?: boolean | string;
+  preparedModel?: PreparedModel;
+  signal?: AbortSignal;
+}
+
+export interface ResponsesCompactOptions {
+  model?: string;
+  input: string | Record<string, unknown>[];
+  instructions?: string;
+  tools?: Record<string, unknown>[];
+  reasoningEffort?: string;
+  reasoningSummary?: ReasoningSummaryOption;
+  reasoning?: ReasoningOptions;
+  promptCacheKey?: string;
+  promptCacheOptions?: PromptCacheOptions;
+  previousResponseId?: string;
+  serviceTier?: string;
+  text?: Record<string, unknown>;
+  clientMetadata?: Record<string, unknown>;
+  codexMetadata?: boolean;
+  responsesLite?: boolean | string;
+  preparedModel?: PreparedModel;
 }
 
 export interface PreparedModel {
@@ -1150,7 +1197,7 @@ export class ChatGPTOAuthProvider {
     opts: {
       model?: string;
       reasoningEffort?: string;
-      reasoningSummary?: "auto" | "none";
+      reasoningSummary?: ReasoningSummaryOption;
       responsesLite?: boolean | string;
       tools?: ToolSchema[];
       promptCacheOptions?: PromptCacheOptions;
@@ -1232,6 +1279,344 @@ export class ChatGPTOAuthProvider {
       throw err;
     }
     return REMOTE_COMPACTION_MARKER + "\n" + JSON.stringify(compacted);
+  }
+
+  async createResponsesStream(
+    opts: ResponsesRequestOptions,
+  ): Promise<AsyncGenerator<Record<string, unknown>>> {
+    const subagent = opts.subagent == null
+      ? undefined
+      : requireSubagentHeaderValue(opts.subagent);
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const payload = this.nativeResponsesPayload(opts, prepared);
+    const extraHeaders: Record<string, string> = {};
+    if (subagent != null) {
+      extraHeaders["x-openai-subagent"] = subagent;
+    }
+    if (opts.memgenRequest != null) {
+      extraHeaders["x-openai-memgen-request"] = opts.memgenRequest
+        ? "true"
+        : "false";
+    }
+    return this.streamResponsesPayload(payload, extraHeaders, prepared, opts.signal);
+  }
+
+  async createResponse(
+    opts: ResponsesRequestOptions,
+  ): Promise<Record<string, unknown>> {
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const stream = await this.createResponsesStream({ ...opts, preparedModel: prepared });
+    const outputItems: Record<string, unknown>[] = [];
+    for await (const event of stream) {
+      if (event.type === "response.output_item.done" && isRecordValue(event.item)) {
+        outputItems.push(event.item);
+      } else if (event.type === "response.completed") {
+        const completed = completedResponseFromEvent(event);
+        const output =
+          Array.isArray(completed.output) && completed.output.length > 0
+            ? (completed.output as Record<string, unknown>[])
+            : outputItems;
+        return {
+          object: "response",
+          status: "completed",
+          model: prepared.slug,
+          ...completed,
+          output,
+          output_text:
+            typeof completed.output_text === "string"
+              ? completed.output_text
+              : textFromResponseItems(output),
+        };
+      }
+    }
+    throw new ChatGPTOAuthProtocolError(
+      "ChatGPT OAuth response stream ended before response.completed",
+    );
+  }
+
+  async compactResponses(
+    opts: ResponsesCompactOptions,
+  ): Promise<Record<string, unknown>> {
+    const prepared = opts.preparedModel ?? await this.prepareModel(opts.model);
+    const requestModel = prepared.slug;
+    const normalizedInput = normalizeNativeResponsesInput(
+      opts.input,
+      requestModel,
+      opts.previousResponseId != null,
+    );
+    const semanticInput = this.resolveSemanticInput(
+      normalizedInput,
+      opts.previousResponseId,
+      prepared.accountId,
+      prepared.capability.compHash,
+    );
+    const toolsPayload = normalizeNativeResponsesTools(opts.tools);
+    const payload: Record<string, unknown> = {
+      model: wireModel(requestModel),
+      input: semanticInput,
+      tools: toolsPayload,
+      parallel_tool_calls: false,
+    };
+    if (opts.instructions != null && opts.instructions.length > 0) {
+      payload.instructions = opts.instructions;
+    }
+    let clientMetadata = normalizeClientMetadata(opts.clientMetadata);
+    if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
+      clientMetadata = buildCodexClientMetadata({
+        authJsonPath: this.authJsonPath,
+        existing: clientMetadata,
+      });
+    }
+    if (clientMetadata != null) {
+      payload.client_metadata = clientMetadata;
+    }
+    if (opts.promptCacheKey != null) {
+      if (
+        typeof opts.promptCacheKey !== "string"
+        || opts.promptCacheKey.trim().length === 0
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          "prompt_cache_key must be a non-empty string when provided",
+        );
+      }
+      payload.prompt_cache_key = opts.promptCacheKey;
+    } else {
+      const sessionId = sessionIdFromClientMetadata(clientMetadata);
+      if (sessionId != null) {
+        payload.prompt_cache_key = sessionId;
+      }
+    }
+    setReasoningPayload(
+      payload,
+      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
+      opts.reasoning,
+      prepared.capability,
+    );
+    rejectUnsupportedPrivateRequestFields(
+      payload,
+      undefined,
+      opts.promptCacheOptions,
+    );
+    validatePromptCacheBreakpoints(payload);
+    finalizeResponsesPayload(payload, {
+      endpoint: "compact",
+      capability: prepared.capability,
+      reasoningSummary: opts.reasoningSummary,
+      responsesLite: opts.responsesLite,
+      serviceTier: opts.serviceTier,
+      text: opts.text,
+      tools: toolsPayload,
+    });
+    const data = await this.postJSON(
+      "/responses/compact",
+      payload,
+      prepared.accountId,
+      prepared.snapshot.key,
+    );
+    const output = data.output;
+    if (!Array.isArray(output)) {
+      throw new ChatGPTOAuthProtocolError(
+        "remote compact response missing output array",
+      );
+    }
+    const validatedOutput: Record<string, unknown>[] = [];
+    for (const [index, item] of output.entries()) {
+      if (!isRecordValue(item)) {
+        throw new ChatGPTOAuthProtocolError(
+          `remote compact output item ${index} must be an object`,
+        );
+      }
+      try {
+        validateCompactedHistoryItem(item, "remote compact output", index);
+      } catch (err) {
+        if (err instanceof ChatGPTOAuthInvalidRequestError) {
+          throw new ChatGPTOAuthProtocolError(err.message);
+        }
+        throw err;
+      }
+      validatedOutput.push(item);
+    }
+    return {
+      object: "response.compaction",
+      ...data,
+      output: validatedOutput,
+    };
+  }
+
+  private async *streamResponsesPayload(
+    payload: Record<string, unknown>,
+    extraHeaders: Record<string, string>,
+    prepared: PreparedModel,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Record<string, unknown>> {
+    const semanticInput = this.semanticInputs.get(payload);
+    if (semanticInput == null) {
+      throw new ChatGPTOAuthProtocolError(
+        "internal error: missing semantic input for response history",
+      );
+    }
+    const finalOutput: Record<string, unknown>[] = [];
+
+    for await (const event of this.postSSE(
+      "/responses",
+      payload,
+      extraHeaders,
+      prepared.accountId,
+      prepared.snapshot.key,
+      signal,
+    )) {
+      if (!validateResponseEvent(event)) {
+        continue;
+      }
+      const typ = event.type;
+      if (typ === "response.output_item.done") {
+        const item = event.item as Record<string, unknown>;
+        finalOutput.push(item);
+        yield event;
+      } else if (typ === "error") {
+        throw new ChatGPTOAuthUpstreamError(
+          502,
+          responseFailureMessage(event, "error"),
+        );
+      } else if (typ === "response.failed") {
+        throw new ChatGPTOAuthUpstreamError(
+          502,
+          responseFailureMessage(event, "failed"),
+        );
+      } else if (typ === "response.incomplete") {
+        throw new ChatGPTOAuthUpstreamError(
+          502,
+          responseFailureMessage(event, "incomplete"),
+        );
+      } else if (typ === "response.completed") {
+        const response = completedResponseFromEvent(event);
+        if (response.usage != null && usageFromResponse(response.usage) == null) {
+          throw new ChatGPTOAuthProtocolError(
+            "response.completed response.usage is malformed",
+          );
+        }
+        const completedOutput =
+          Array.isArray(response.output) && response.output.length > 0
+            ? response.output
+            : finalOutput;
+        const chainOutput = finalOutput.length > 0 ? finalOutput : completedOutput;
+        this.responseChains.commit(
+          prepared.accountId,
+          response.id as string,
+          semanticInput,
+          chainOutput,
+          prepared.capability.compHash,
+        );
+        yield {
+          ...event,
+          response: {
+            object: "response",
+            status: "completed",
+            model: prepared.slug,
+            ...response,
+            output: completedOutput,
+          },
+        };
+        return;
+      } else {
+        yield event;
+      }
+    }
+    throw new ChatGPTOAuthProtocolError(
+      "ChatGPT OAuth response stream ended before response.completed",
+    );
+  }
+
+  private nativeResponsesPayload(
+    opts: ResponsesRequestOptions,
+    prepared: PreparedModel,
+  ): Record<string, unknown> {
+    const requestModel = prepared.slug;
+    const normalizedInput = normalizeNativeResponsesInput(
+      opts.input,
+      requestModel,
+      opts.previousResponseId != null,
+    );
+    const semanticInput = this.resolveSemanticInput(
+      normalizedInput,
+      opts.previousResponseId,
+      prepared.accountId,
+      prepared.capability.compHash,
+    );
+    const toolsPayload = normalizeNativeResponsesTools(opts.tools);
+    const lite = useResponsesLite(prepared.capability, opts.responsesLite);
+    const include: string[] = opts.include ? [...opts.include] : [];
+    const payload: Record<string, unknown> = {
+      model: wireModel(requestModel),
+      input: semanticInput,
+      tools: toolsPayload,
+      tool_choice: opts.toolChoice ?? "auto",
+      parallel_tool_calls: shouldEnableParallelToolCalls({
+        requested: opts.parallelToolCalls,
+        responsesLite: lite,
+      }),
+      stream: true,
+      store: false,
+      include,
+    };
+    if (opts.instructions != null && opts.instructions.length > 0) {
+      payload.instructions = opts.instructions;
+    }
+    if (
+      toolsPayload.some((tool) => tool.type === "web_search")
+      && !include.includes("web_search_call.action.sources")
+    ) {
+      include.push("web_search_call.action.sources");
+    }
+    let clientMetadata = normalizeClientMetadata(opts.clientMetadata);
+    if (resolveCodexMetadataEnabled(opts.codexMetadata)) {
+      clientMetadata = buildCodexClientMetadata({
+        authJsonPath: this.authJsonPath,
+        existing: clientMetadata,
+      });
+    }
+    if (clientMetadata != null) {
+      payload.client_metadata = clientMetadata;
+    }
+    if (opts.promptCacheKey != null) {
+      if (
+        typeof opts.promptCacheKey !== "string"
+        || opts.promptCacheKey.trim().length === 0
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          "prompt_cache_key must be a non-empty string when provided",
+        );
+      }
+      payload.prompt_cache_key = opts.promptCacheKey;
+    } else {
+      const sessionId = sessionIdFromClientMetadata(clientMetadata);
+      if (sessionId != null) {
+        payload.prompt_cache_key = sessionId;
+      }
+    }
+    setReasoningPayload(
+      payload,
+      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
+      opts.reasoning,
+      prepared.capability,
+    );
+    rejectUnsupportedPrivateRequestFields(
+      payload,
+      opts.safetyIdentifier,
+      opts.promptCacheOptions,
+    );
+    validatePromptCacheBreakpoints(payload);
+    finalizeResponsesPayload(payload, {
+      endpoint: "responses",
+      capability: prepared.capability,
+      reasoningSummary: opts.reasoningSummary,
+      responsesLite: lite,
+      serviceTier: opts.serviceTier,
+      text: opts.text,
+      tools: toolsPayload,
+    });
+    this.semanticInputs.set(payload, cloneResponseItems(semanticInput));
+    return payload;
   }
 
   private async collectResponseOutputItems(
@@ -2495,6 +2880,302 @@ export function messageItem(
   };
 }
 
+export function normalizeNativeResponsesInput(
+  input: unknown,
+  targetModel?: string,
+  allowEmpty = false,
+): Record<string, unknown>[] {
+  if (typeof input === "string") {
+    return [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: input }],
+      },
+    ];
+  }
+  if (!Array.isArray(input)) {
+    throw new ChatGPTOAuthInvalidRequestError("input must be a string or an array");
+  }
+  if (input.length === 0 && !allowEmpty) {
+    throw new ChatGPTOAuthInvalidRequestError("input must not be empty");
+  }
+  const items: Record<string, unknown>[] = [];
+  for (const [index, rawItem] of input.entries()) {
+    if (!isRecordValue(rawItem)) {
+      throw new ChatGPTOAuthInvalidRequestError(`input item ${index} must be an object`);
+    }
+    const itemType =
+      typeof rawItem.type === "string"
+        ? rawItem.type
+        : typeof rawItem.role === "string"
+          ? "message"
+          : undefined;
+    if (!itemType) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `input item ${index} requires a string type or role`,
+      );
+    }
+    if (itemType === "message") {
+      const rawRole = rawItem.role;
+      if (
+        typeof rawRole !== "string"
+        || !["user", "assistant", "developer", "system"].includes(rawRole)
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `input message item ${index} role must be user, assistant, developer, or system`,
+        );
+      }
+      const role = rawRole === "system" ? "developer" : rawRole;
+      const defaultTextType = role === "assistant" ? "output_text" : "input_text";
+      const rawContent = rawItem.content;
+      let contentParts: Record<string, unknown>[];
+      if (typeof rawContent === "string") {
+        contentParts = [{ type: defaultTextType, text: rawContent }];
+      } else if (Array.isArray(rawContent)) {
+        contentParts = rawContent.map((part, partIndex) => {
+          if (!isRecordValue(part)) {
+            throw new ChatGPTOAuthInvalidRequestError(
+              `input message item ${index} content item ${partIndex} must be an object`,
+            );
+          }
+          if (part.type === "text" && typeof part.text === "string") {
+            return { ...part, type: defaultTextType };
+          }
+          return { ...part };
+        });
+        validateMessageContentItems(contentParts, "input", index);
+      } else {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `input message item ${index} content must be a string or an array`,
+        );
+      }
+      const normalizedMessage: Record<string, unknown> = {
+        type: "message",
+        role,
+        content: contentParts,
+      };
+      if (typeof rawItem.id === "string" && rawItem.id.length > 0) {
+        normalizedMessage.id = rawItem.id;
+      }
+      if (typeof rawItem.status === "string" && rawItem.status.length > 0) {
+        normalizedMessage.status = rawItem.status;
+      }
+      items.push(normalizedMessage);
+      continue;
+    }
+    if (itemType === "function_call") {
+      if (
+        typeof rawItem.call_id !== "string"
+        || rawItem.call_id.length === 0
+        || typeof rawItem.name !== "string"
+        || rawItem.name.length === 0
+        || typeof rawItem.arguments !== "string"
+      ) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `input function_call item ${index} requires non-empty string call_id/name and string arguments`,
+        );
+      }
+      const callItem: Record<string, unknown> = {
+        type: "function_call",
+        call_id: rawItem.call_id,
+        name: rawItem.name,
+        arguments: rawItem.arguments,
+      };
+      if (typeof rawItem.id === "string" && rawItem.id.length > 0) {
+        callItem.id = rawItem.id;
+      }
+      if (typeof rawItem.status === "string" && rawItem.status.length > 0) {
+        callItem.status = rawItem.status;
+      }
+      items.push(callItem);
+      continue;
+    }
+    if (itemType === "function_call_output") {
+      if (typeof rawItem.call_id !== "string" || rawItem.call_id.length === 0) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `input function_call_output item ${index} requires a non-empty string call_id`,
+        );
+      }
+      const output = rawItem.output;
+      if (typeof output !== "string" && !Array.isArray(output)) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `input function_call_output item ${index} requires string or array output`,
+        );
+      }
+      if (Array.isArray(output)) {
+        validateMessageContentItems(output, "input function_call_output", index);
+      }
+      const outItem: Record<string, unknown> = {
+        type: "function_call_output",
+        call_id: rawItem.call_id,
+        output,
+      };
+      if (typeof rawItem.id === "string" && rawItem.id.length > 0) {
+        outItem.id = rawItem.id;
+      }
+      if (typeof rawItem.status === "string" && rawItem.status.length > 0) {
+        outItem.status = rawItem.status;
+      }
+      items.push(outItem);
+      continue;
+    }
+    if (itemType === "reasoning") {
+      const itemModel = rawItem.model;
+      if (itemModel !== undefined) {
+        if (
+          typeof itemModel !== "string"
+          || itemModel.length === 0
+          || itemModel.trim() !== itemModel
+        ) {
+          throw new ChatGPTOAuthInvalidRequestError(
+            `input reasoning item ${index} model must be a non-empty trimmed string`,
+          );
+        }
+      }
+      const { model: _ignoredModel, ...restItem } = rawItem;
+      if (typeof restItem.encrypted_content === "string" && restItem.encrypted_content.length > 0) {
+        const validated = validateReplayableReasoningItem({
+          type: "reasoning",
+          ...restItem,
+        });
+        if (
+          typeof itemModel === "string"
+          && typeof targetModel === "string"
+          && targetModel.length > 0
+          && !isReasoningModelCompatible(itemModel, targetModel)
+        ) {
+          continue;
+        }
+        items.push({
+          type: "reasoning",
+          ...(validated.id !== undefined ? { id: validated.id } : {}),
+          encrypted_content: validated.encrypted_content,
+          summary: validated.summary.map((part) => ({
+            type: "summary_text",
+            text: part.text,
+          })),
+        });
+        continue;
+      }
+      validateCompactedHistoryItem({ ...restItem, type: "reasoning" }, "input", index);
+      items.push({ ...restItem, type: "reasoning" });
+      continue;
+    }
+    if (
+      itemType === "compaction"
+      || itemType === "compaction_summary"
+      || itemType === "context_compaction"
+      || itemType === "agent_message"
+    ) {
+      validateCompactedHistoryItem(rawItem, "input", index);
+      items.push({ ...rawItem });
+      continue;
+    }
+    throw new ChatGPTOAuthInvalidRequestError(
+      `input item ${index} has an unsupported type ${JSON.stringify(itemType)}`,
+    );
+  }
+  return items;
+}
+
+export function normalizeNativeResponsesTools(
+  tools: unknown,
+): Record<string, unknown>[] {
+  if (tools == null) return [];
+  if (!Array.isArray(tools)) {
+    throw new ChatGPTOAuthInvalidRequestError("tools must be an array");
+  }
+  return tools.map((rawTool, index) => {
+    if (!isRecordValue(rawTool)) {
+      throw new ChatGPTOAuthInvalidRequestError(`tools[${index}] must be an object`);
+    }
+    const toolType = rawTool.type;
+    if (typeof toolType !== "string" || toolType.length === 0) {
+      throw new ChatGPTOAuthInvalidRequestError(`tools[${index}].type must be a non-empty string`);
+    }
+    if (toolType === "function") {
+      if (rawTool.function != null && !isRecordValue(rawTool.function)) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools[${index}].function must be an object`,
+        );
+      }
+      const fnSource = isRecordValue(rawTool.function) ? rawTool.function : rawTool;
+      const name = fnSource.name;
+      if (typeof name !== "string" || name.trim().length === 0) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools[${index}] function requires a non-empty string name`,
+        );
+      }
+      const parameters = fnSource.parameters ?? { type: "object", properties: {} };
+      if (!isRecordValue(parameters)) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools[${index}] function parameters must be an object`,
+        );
+      }
+      if (fnSource.strict != null && typeof fnSource.strict !== "boolean") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools[${index}] function strict must be a boolean`,
+        );
+      }
+      if (fnSource.description != null && typeof fnSource.description !== "string") {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `tools[${index}] function description must be a string`,
+        );
+      }
+      const out: Record<string, unknown> = {
+        type: "function",
+        name,
+        parameters,
+        strict: fnSource.strict ?? false,
+      };
+      if (typeof fnSource.description === "string") {
+        out.description = fnSource.description;
+      }
+      return out;
+    }
+    if (
+      toolType === "web_search"
+      || toolType === "web_search_preview"
+      || toolType === "web_search_preview_2025_03_11"
+    ) {
+      const out: Record<string, unknown> = { type: "web_search" };
+      if (rawTool.search_context_size != null) {
+        if (
+          typeof rawTool.search_context_size !== "string"
+          || !["low", "medium", "high"].includes(rawTool.search_context_size)
+        ) {
+          throw new ChatGPTOAuthInvalidRequestError(
+            `tools[${index}].search_context_size must be low, medium, or high`,
+          );
+        }
+        out.search_context_size = rawTool.search_context_size;
+      }
+      if (rawTool.filters != null) {
+        if (!isRecordValue(rawTool.filters)) {
+          throw new ChatGPTOAuthInvalidRequestError(`tools[${index}].filters must be an object`);
+        }
+        out.filters = rawTool.filters;
+      }
+      if (rawTool.user_location != null) {
+        if (!isRecordValue(rawTool.user_location)) {
+          throw new ChatGPTOAuthInvalidRequestError(
+            `tools[${index}].user_location must be an object`,
+          );
+        }
+        out.user_location = rawTool.user_location;
+      }
+      return out;
+    }
+    if (toolType === "image_generation") {
+      return { ...rawTool, type: "image_generation" };
+    }
+    throw new ChatGPTOAuthInvalidRequestError(
+      `tools[${index}] has unsupported type ${JSON.stringify(toolType)}`,
+    );
+  });
+}
+
 export function toolSchemaToResponseDict(
   tool: ToolSchema,
 ): Record<string, unknown> {
@@ -2536,7 +3217,7 @@ function finalizeResponsesPayload(
   opts: {
     endpoint: "responses" | "compact";
     capability: ModelCapability;
-    reasoningSummary?: "auto" | "none";
+    reasoningSummary?: ReasoningSummaryOption;
     responsesLite?: boolean | string;
     serviceTier?: string;
     text?: Record<string, unknown>;
@@ -2563,6 +3244,11 @@ function finalizeResponsesPayload(
   if (opts.capability.supportsReasoningSummaryParameter) {
     if (opts.reasoningSummary === "none") {
       configuredSummary = "none";
+    } else if (
+      opts.reasoningSummary === "concise"
+      || opts.reasoningSummary === "detailed"
+    ) {
+      configuredSummary = opts.reasoningSummary;
     } else if (opts.reasoningSummary === "auto") {
       configuredSummary = opts.capability.defaultReasoningSummary !== "none"
         ? opts.capability.defaultReasoningSummary
@@ -3153,10 +3839,35 @@ export function webSearchEventFromResponseItem(
   };
 }
 
+function optionalWebSearchActionString(
+  action: Record<string, unknown>,
+  field: string,
+): string | null {
+  const value = action[field];
+  if (value == null) return null;
+  if (typeof value !== "string") {
+    throw new ChatGPTOAuthProtocolError(`web_search_call action.${field} must be a string`);
+  }
+  return value.trim().length > 0 ? value : null;
+}
+
 function webSearchQueryFromAction(action: Record<string, unknown>): string {
   const actionType = action.type;
   if (typeof actionType !== "string") {
     throw new ChatGPTOAuthProtocolError("web_search_call action.type must be a string");
+  }
+  if (actionType === "open_page") {
+    const url = optionalWebSearchActionString(action, "url");
+    return url !== null ? `open_page: ${url}` : "open_page";
+  }
+  if (actionType === "find_in_page") {
+    const pattern = optionalWebSearchActionString(action, "pattern");
+    const url = optionalWebSearchActionString(action, "url");
+    if (pattern !== null && url !== null) {
+      return `find_in_page: ${pattern} (${url})`;
+    }
+    const detail = pattern ?? url;
+    return detail !== null ? `find_in_page: ${detail}` : "find_in_page";
   }
   if (actionType !== "search") {
     throw new ChatGPTOAuthProtocolError(
@@ -3180,22 +3891,29 @@ function webSearchQueryFromAction(action: Record<string, unknown>): string {
   if (query != null && typeof query !== "string") {
     throw new ChatGPTOAuthProtocolError("web_search_call action.query must be a string");
   }
-  if (Array.isArray(queries) && queries.length > 1) {
-    throw new ChatGPTOAuthProtocolError(
-      "web_search_call action contains multiple queries that cannot be represented by this facade",
-    );
-  }
-  if (typeof query === "string") {
-    if (Array.isArray(queries) && queries.length === 1 && queries[0] !== query) {
+  if (Array.isArray(queries) && queries.length > 0) {
+    const queryStrings = queries as string[];
+    if (typeof query === "string" && !queryStrings.includes(query)) {
       throw new ChatGPTOAuthProtocolError("web_search_call action.query conflicts with action.queries");
     }
+    if (queryStrings.length === 1) {
+      return typeof query === "string" ? query : queryStrings[0];
+    }
+    return queryStrings.join(" | ");
+  }
+  if (typeof query === "string") {
     return query;
   }
-  if (Array.isArray(queries) && queries.length === 1) return queries[0] as string;
   throw new ChatGPTOAuthProtocolError("web_search_call action must contain a query");
 }
 
 function webSearchSourcesFromAction(action: Record<string, unknown>): Record<string, unknown>[] {
+  if (
+    (action.type === "open_page" || action.type === "find_in_page")
+    && action.sources == null
+  ) {
+    return [];
+  }
   if (!Object.hasOwn(action, "sources")) {
     throw new ChatGPTOAuthProtocolError(
       "web_search_call action.sources is required when sources were requested",

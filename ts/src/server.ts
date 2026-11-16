@@ -30,7 +30,12 @@ import {
   validateImageContentItems,
   wireReasoningEffort,
 } from "./provider.js";
-import type { ImageReference, ReasoningOptions, StreamEvent } from "./provider.js";
+import type {
+  ImageReference,
+  ReasoningOptions,
+  ReasoningSummaryOption,
+  StreamEvent,
+} from "./provider.js";
 import {
   anthropicRequestToInternal,
   internalResponseToAnthropic,
@@ -190,6 +195,63 @@ const INSPECT_FIELDS = new Set<string>([
   "tools",
 ]);
 
+const OPENAI_RESPONSES_FIELDS = new Set<string>([
+  "model",
+  "input",
+  "instructions",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls",
+  "reasoning",
+  "reasoning_effort",
+  "include",
+  "stream",
+  "store",
+  "metadata",
+  "user",
+  "previous_response_id",
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "safety_identifier",
+  "service_tier",
+  "text",
+  "verbosity",
+  "client_metadata",
+  "codex_metadata",
+  "responses_lite",
+  "subagent",
+  "memgen_request",
+  "temperature",
+  "top_p",
+  "max_output_tokens",
+  "truncation",
+  "multi_agent",
+  "programmatic_tool_calling",
+]);
+
+const OPENAI_RESPONSES_COMPACT_FIELDS = new Set<string>([
+  "model",
+  "input",
+  "instructions",
+  "tools",
+  "reasoning",
+  "reasoning_effort",
+  "previous_response_id",
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "service_tier",
+  "text",
+  "verbosity",
+  "client_metadata",
+  "codex_metadata",
+  "responses_lite",
+  "safety_identifier",
+  "include",
+  "prompt_cache_retention",
+  "multi_agent",
+  "programmatic_tool_calling",
+]);
+
 const OPENAI_COMPACT_FIELDS = new Set<string>([
   "model",
   "messages",
@@ -217,6 +279,9 @@ const ANTHROPIC_COMPACT_FIELDS = new Set<string>([
   "tools",
   "tool_choice",
   "stop_sequences",
+  "temperature",
+  "top_p",
+  "top_k",
   "thinking",
   "output_config",
   "output_format",
@@ -249,6 +314,9 @@ const ANTHROPIC_COUNT_FIELDS = new Set<string>([
   "tools",
   "tool_choice",
   "stop_sequences",
+  "temperature",
+  "top_p",
+  "top_k",
   "thinking",
   "output_format",
   "output_config",
@@ -462,6 +530,18 @@ function writeOpenAIStreamError(err: unknown, res: Response): void {
   const type = errorType(err);
   res.write(
     `data: ${JSON.stringify({
+      error: { message: publicErrorMessage(err), type, code: type },
+    })}\n\n`,
+  );
+  res.end();
+}
+
+function writeResponsesStreamError(err: unknown, res: Response): void {
+  if (res.writableEnded) return;
+  const type = errorType(err);
+  res.write(
+    `event: error\ndata: ${JSON.stringify({
+      type: "error",
       error: { message: publicErrorMessage(err), type, code: type },
     })}\n\n`,
   );
@@ -817,6 +897,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         const responsesLite = optionalBooleanOrString(body.responses_lite, "responses_lite");
         const parallelToolCalls = optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
         const stream = optionalBoolean(body.stream, "stream") ?? false;
+        const streamOptions = validateStreamOptions(body.stream_options, stream);
+        validateStoreOption(body.store);
+        optionalString(body.user, "user");
         const requestedModel = optionalModel(body.model);
 
         const subagent = mergeBodyAndHeaderString(
@@ -1063,7 +1146,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           if (!sawFinish || upstreamResponseId == null) {
             throw new ChatGPTOAuthProtocolError("provider stream ended before finish");
           }
-          if (parsedUsage != null) {
+          if (parsedUsage != null && streamOptions?.include_usage !== false) {
             const finishChunk = {
               id: requestId,
               object: "chat.completion.chunk",
@@ -1163,6 +1246,200 @@ export function createApp(opts?: CreateAppOptions): express.Express {
   );
 
   app.post(
+    "/v1/responses",
+    async (req: Request, res: Response) => {
+      try {
+        const body = requireRequestBody(req.body);
+        assertAllowedTopLevelFields(body, OPENAI_RESPONSES_FIELDS, "/v1/responses");
+        rejectExplicitNullFields(body, [
+          "model",
+          "input",
+          "parallel_tool_calls",
+          "prompt_cache_key",
+          "safety_identifier",
+          "tool_choice",
+          "tools",
+          "user",
+        ]);
+        rejectUnsupportedGenerationFeatures(body, { allowHostedTools: true });
+        validateStoreOption(body.store);
+        optionalString(body.user, "user");
+        if (body.truncation != null && body.truncation !== "disabled") {
+          throw new ChatGPTOAuthInvalidRequestError(
+            "truncation is not supported by the private Codex OAuth transport",
+          );
+        }
+        const maxTokens = optionalPositiveInteger(body.max_output_tokens, "max_output_tokens");
+        const temperature = optionalFiniteNumber(body.temperature, "temperature");
+        rejectUnsupportedTransportControls({ maxTokens, temperature });
+        if (!Object.hasOwn(body, "input")) {
+          throw new ChatGPTOAuthInvalidRequestError("input is required");
+        }
+        const instructions = optionalString(body.instructions, "instructions");
+        const tools = optionalRecordArray(body.tools, "tools");
+        const toolChoice = optionalResponsesToolChoice(body.tool_choice);
+        const include = optionalStringArray(body.include, "include");
+        const promptCacheKey = resolvePromptCacheKey(body.prompt_cache_key);
+        const previousResponseId = resolvePreviousResponseId(body.previous_response_id);
+        const serviceTier = optionalString(body.service_tier, "service_tier");
+        const clientMetadata = optionalStringRecord(body.client_metadata, "client_metadata");
+        const codexMetadata = optionalBoolean(body.codex_metadata, "codex_metadata");
+        const responsesLite = optionalBooleanOrString(body.responses_lite, "responses_lite");
+        const parallelToolCalls = optionalBoolean(body.parallel_tool_calls, "parallel_tool_calls");
+        const stream = optionalBoolean(body.stream, "stream") ?? false;
+        const requestedModel = optionalModel(body.model);
+
+        const subagent = mergeBodyAndHeaderString(
+          optionalString(body.subagent, "subagent"),
+          optionalHeader(req.headers["x-openai-subagent"], "x-openai-subagent"),
+          "subagent",
+          "x-openai-subagent",
+        );
+        if (subagent != null) requireSubagentHeaderValue(subagent);
+        const memgenRequest = mergeBodyAndHeaderBoolean(
+          optionalBoolean(body.memgen_request, "memgen_request"),
+          optionalBooleanHeader(
+            req.headers["x-openai-memgen-request"],
+            "x-openai-memgen-request",
+          ),
+          "memgen_request",
+          "x-openai-memgen-request",
+        );
+        const preparedModel = await provider.prepareModel(requestedModel ?? model);
+        const requestModel = preparedModel.slug;
+        const {
+          reasoning: reasoningWithoutSummary,
+          reasoningSummary,
+        } = extractResponsesReasoningSummary(body.reasoning);
+        const reasoning = resolveReasoning(
+          reasoningWithoutSummary,
+          body.reasoning_effort,
+          codexConfig,
+          preparedModel.capability,
+        );
+        const responsesOpts = {
+          model: requestModel,
+          input: body.input as string | Record<string, unknown>[],
+          instructions,
+          tools,
+          toolChoice,
+          parallelToolCalls,
+          reasoningEffort: reasoning?.effort,
+          reasoningSummary,
+          reasoning,
+          include,
+          promptCacheKey,
+          subagent,
+          memgenRequest,
+          previousResponseId,
+          serviceTier,
+          text: resolveTextOptions(body.text, body.verbosity),
+          clientMetadata,
+          codexMetadata,
+          responsesLite,
+          preparedModel,
+        };
+
+        if (stream) {
+          const downstream = downstreamAbortController(res);
+          let responseStream: AsyncGenerator<Record<string, unknown>> | undefined;
+          try {
+            responseStream = await provider.createResponsesStream({
+              ...responsesOpts,
+              signal: downstream.controller.signal,
+            });
+            res.setHeader("Content-Type", "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            res.setHeader("Connection", "keep-alive");
+
+            for await (const event of responseStream) {
+              const eventType = typeof event.type === "string" ? event.type : "message";
+              await writeWithBackpressure(
+                res,
+                `event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`,
+                downstream.controller.signal,
+              );
+            }
+            res.end();
+          } finally {
+            downstream.dispose();
+            await responseStream?.return(undefined);
+          }
+        } else {
+          const response = await provider.createResponse(responsesOpts);
+          res.json(response);
+        }
+      } catch (err) {
+        if (res.headersSent) {
+          writeResponsesStreamError(err, res);
+        } else {
+          handleError(err, res);
+        }
+      }
+    },
+  );
+
+  app.post(
+    "/v1/responses/compact",
+    async (req: Request, res: Response) => {
+      try {
+        const body = requireRequestBody(req.body);
+        assertAllowedTopLevelFields(body, OPENAI_RESPONSES_COMPACT_FIELDS, "/v1/responses/compact");
+        rejectExplicitNullFields(body, [
+          "model",
+          "input",
+          "prompt_cache_key",
+          "tools",
+        ]);
+        rejectUnsupportedGenerationFeatures(body, { allowHostedTools: true });
+        rejectUnsupportedCompactFields(body);
+        if (!Object.hasOwn(body, "input")) {
+          throw new ChatGPTOAuthInvalidRequestError("input is required");
+        }
+        const instructions = optionalString(body.instructions, "instructions");
+        const tools = optionalRecordArray(body.tools, "tools");
+        const promptCacheKey = resolvePromptCacheKey(body.prompt_cache_key);
+        const previousResponseId = resolvePreviousResponseId(body.previous_response_id);
+        const serviceTier = optionalString(body.service_tier, "service_tier");
+        const clientMetadata = optionalStringRecord(body.client_metadata, "client_metadata");
+        const codexMetadata = optionalBoolean(body.codex_metadata, "codex_metadata");
+        const responsesLite = optionalBooleanOrString(body.responses_lite, "responses_lite");
+        const requestedModel = optionalModel(body.model);
+        const preparedModel = await provider.prepareModel(requestedModel ?? model);
+        const requestModel = preparedModel.slug;
+        const {
+          reasoning: reasoningWithoutSummary,
+          reasoningSummary,
+        } = extractResponsesReasoningSummary(body.reasoning);
+        const reasoningEffort = resolveReasoningEffort(
+          compactReasoningEffort(reasoningWithoutSummary, body.reasoning_effort),
+          codexConfig,
+          preparedModel.capability,
+        );
+        const compacted = await provider.compactResponses({
+          model: requestModel,
+          input: body.input as string | Record<string, unknown>[],
+          instructions,
+          tools,
+          reasoningEffort,
+          reasoningSummary,
+          promptCacheKey,
+          previousResponseId,
+          serviceTier,
+          text: resolveTextOptions(body.text, body.verbosity),
+          clientMetadata,
+          codexMetadata,
+          responsesLite,
+          preparedModel,
+        });
+        res.json(compacted);
+      } catch (err) {
+        handleError(err, res);
+      }
+    },
+  );
+
+  app.post(
     "/v1/images/generations",
     async (req: Request, res: Response) => {
       try {
@@ -1170,6 +1447,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         assertAllowedTopLevelFields(body, IMAGE_GENERATION_FIELDS, "/v1/images/generations");
         rejectExplicitNullFields(body, ["user"]);
         rejectUnsupportedGenerationFeatures(body);
+        optionalString(body.user, "user");
         rejectNonNullUnsupportedFields(body, ["output_format", "partial_images", "stream"]);
         if (Object.hasOwn(body, "tools")) {
           throw new ChatGPTOAuthInvalidRequestError(
@@ -1274,15 +1552,20 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         isAnthropicCompact ? ANTHROPIC_COMPACT_FIELDS : OPENAI_COMPACT_FIELDS,
         req.path,
       );
-      rejectUnsupportedGenerationFeatures(body, { anthropic: isAnthropicCompact });
+      rejectUnsupportedGenerationFeatures(body, {
+        anthropic: isAnthropicCompact,
+        allowSamplingControls: isAnthropicCompact,
+      });
       rejectUnsupportedCompactFields(body);
-      optionalPositiveInteger(body.max_tokens, "max_tokens");
-      if (body.stop_sequences != null) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "stop_sequences is not supported by the private Codex OAuth transport",
-        );
-      }
       if (isAnthropicCompact) {
+        rejectExplicitNullFields(body, ["max_tokens"]);
+      }
+      optionalPositiveInteger(body.max_tokens, "max_tokens");
+      optionalStringArray(body.stop_sequences, "stop_sequences");
+      if (isAnthropicCompact) {
+        optionalFiniteNumber(body.temperature, "temperature");
+        optionalFiniteNumber(body.top_p, "top_p");
+        optionalPositiveInteger(body.top_k, "top_k");
         validateAnthropicContextManagement(body.context_management);
       }
       const requestedModel = optionalModel(body.model);
@@ -1361,25 +1644,18 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     try {
       resolveClaudeCodeSessionId(req);
       const rawBody = requireRequestBody(req.body);
-      rejectAnthropicUnsupportedFieldPresence(rawBody, [
-        "temperature",
-        "top_p",
-        "top_k",
-      ]);
       validateAnthropicMetadata(rawBody.metadata);
       rejectExplicitNullFields(rawBody, ["max_tokens"]);
       rejectExplicitNullAnthropicFields(rawBody);
       const body = stripAnthropicCacheControls(rawBody);
       assertAllowedTopLevelFields(body, ANTHROPIC_COUNT_FIELDS, "/v1/messages/count_tokens");
-      rejectUnsupportedGenerationFeatures(body, { anthropic: true });
+      rejectUnsupportedGenerationFeatures(body, { anthropic: true, allowSamplingControls: true });
       validateAnthropicContextManagement(body.context_management);
+      optionalFiniteNumber(body.temperature, "temperature");
+      optionalFiniteNumber(body.top_p, "top_p");
+      optionalPositiveInteger(body.top_k, "top_k");
       const requestedModel = optionalModel(body.model);
       const maxTokens = optionalPositiveInteger(body.max_tokens, "max_tokens");
-      if (body.stop_sequences != null) {
-        throw new ChatGPTOAuthInvalidRequestError(
-          "stop_sequences is not supported by the private Codex OAuth transport",
-        );
-      }
       const { messages, tools } = anthropicRequestToInternal({
         model: requestedModel,
         messages: requiredMessageRecords(body),
@@ -2142,7 +2418,7 @@ function messagesFromCompactBody(
       model: optionalModel(body.model) ?? model,
       messages: requiredMessageRecords(body),
       system: anthropicSystem(body.system),
-      maxTokens: requiredPositiveInteger(body.max_tokens, "max_tokens"),
+      maxTokens: optionalPositiveInteger(body.max_tokens, "max_tokens"),
       tools: optionalRecordArray(body.tools, "tools"),
       toolChoice: optionalRecord(body.tool_choice, "tool_choice"),
       stopSequences: optionalStringArray(body.stop_sequences, "stop_sequences"),
@@ -2150,16 +2426,6 @@ function messagesFromCompactBody(
       outputFormat: anthropicOutputFormatFromBody(body),
       outputConfig: body.output_config,
     });
-    if (converted.parallelToolCalls === true) {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "tool_choice.disable_parallel_tool_use=false cannot be represented by the compact endpoint",
-      );
-    }
-    if (converted.toolChoice != null && converted.toolChoice !== "auto") {
-      throw new ChatGPTOAuthInvalidRequestError(
-        "compact supports only Anthropic tool_choice.type=auto",
-      );
-    }
     return {
       messages: converted.messages,
       reasoningEffort: converted.reasoningEffort,
@@ -3122,21 +3388,18 @@ function validateAnthropicMetadata(value: unknown): void {
   if (!isRecord(value)) {
     throw new ChatGPTOAuthInvalidRequestError("metadata must be an object");
   }
-  assertRecordFields(value, new Set(["user_id"]), "metadata");
-  if (
-    value.user_id !== undefined
-    && value.user_id !== null
-    && typeof value.user_id !== "string"
-  ) {
-    throw new ChatGPTOAuthInvalidRequestError(
-      "metadata.user_id must be a string or null",
-    );
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== null && typeof entry !== "string") {
+      throw new ChatGPTOAuthInvalidRequestError(
+        `metadata.${key} must be a string or null`,
+      );
+    }
   }
 }
 
 function rejectUnsupportedGenerationFeatures(
   body: Record<string, unknown>,
-  opts: { anthropic?: boolean } = {},
+  opts: { anthropic?: boolean; allowSamplingControls?: boolean; allowHostedTools?: boolean } = {},
 ): void {
   for (const field of UNSUPPORTED_GENERATION_FIELDS) {
     if (
@@ -3144,7 +3407,11 @@ function rejectUnsupportedGenerationFeatures(
       || field === "prompt_cache_options"
       || field === "multi_agent"
       || field === "programmatic_tool_calling"
+      || field === "store"
+      || field === "stream_options"
+      || field === "user"
       || (opts.anthropic === true && field === "metadata")
+      || (opts.allowSamplingControls === true && (field === "top_p" || field === "top_k"))
     ) {
       continue;
     }
@@ -3262,11 +3529,104 @@ function rejectUnsupportedCompactFields(body: Record<string, unknown>): void {
   }
 }
 
+function validateStoreOption(value: unknown): void {
+  if (value == null) return;
+  if (typeof value !== "boolean") {
+    throw new ChatGPTOAuthInvalidRequestError("store must be a boolean when provided");
+  }
+  if (value !== false) {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "store is not supported by the private Codex OAuth transport",
+    );
+  }
+}
+
+function validateStreamOptions(
+  value: unknown,
+  stream = false,
+): { include_usage?: boolean } | undefined {
+  if (value == null) return undefined;
+  if (!stream) {
+    throw new ChatGPTOAuthInvalidRequestError("stream_options is only valid when stream=true");
+  }
+  if (!isRecord(value)) {
+    throw new ChatGPTOAuthInvalidRequestError("stream_options must be an object when provided");
+  }
+  assertRecordFields(value, new Set(["include_usage"]), "stream_options");
+  if (value.include_usage != null && typeof value.include_usage !== "boolean") {
+    throw new ChatGPTOAuthInvalidRequestError(
+      "stream_options.include_usage must be a boolean when provided",
+    );
+  }
+  return {
+    ...(typeof value.include_usage === "boolean"
+      ? { include_usage: value.include_usage }
+      : {}),
+  };
+}
+
+function extractResponsesReasoningSummary(rawReasoning: unknown): {
+  reasoning: unknown;
+  reasoningSummary?: ReasoningSummaryOption;
+} {
+  if (rawReasoning == null || typeof rawReasoning !== "object" || Array.isArray(rawReasoning)) {
+    return { reasoning: rawReasoning };
+  }
+  const record = rawReasoning as Record<string, unknown>;
+  if (!Object.hasOwn(record, "summary")) {
+    return { reasoning: rawReasoning };
+  }
+  const { summary, ...rest } = record;
+  let reasoningSummary: ReasoningSummaryOption | undefined;
+  if (summary != null) {
+    if (
+      typeof summary !== "string"
+      || !["auto", "concise", "detailed", "none"].includes(summary)
+    ) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "reasoning.summary must be one of: auto, concise, detailed, none",
+      );
+    }
+    reasoningSummary = summary as ReasoningSummaryOption;
+  }
+  return { reasoning: rest, reasoningSummary };
+}
+
+function optionalResponsesToolChoice(
+  value: unknown,
+): string | Record<string, unknown> | undefined {
+  if (value == null) return undefined;
+  if (typeof value === "string") {
+    if (!["auto", "none", "required"].includes(value)) {
+      throw new ChatGPTOAuthInvalidRequestError(
+        "tool_choice must be one of: auto, none, required, or a tool selection object",
+      );
+    }
+    return value;
+  }
+  if (!isRecord(value)) {
+    throw new ChatGPTOAuthInvalidRequestError("tool_choice must be a string or object when provided");
+  }
+  if (value.type === "web_search" || value.type === "web_search_preview") {
+    return { type: "web_search" };
+  }
+  if (value.type === "function") {
+    if (typeof value.name === "string" && value.name.length > 0) {
+      return { type: "function", name: value.name };
+    }
+    if (isRecord(value.function) && typeof value.function.name === "string" && value.function.name.length > 0) {
+      return { type: "function", name: value.function.name };
+    }
+    throw new ChatGPTOAuthInvalidRequestError("tool_choice function selection requires a non-empty name");
+  }
+  throw new ChatGPTOAuthInvalidRequestError("tool_choice object has an unsupported type");
+}
+
 function normalizeStop(stop: unknown): string[] | undefined {
   if (stop == null) return undefined;
   if (typeof stop === "string") return [stop];
   if (Array.isArray(stop) && stop.every((value) => typeof value === "string")) {
-    return stop as string[];
+    return stop.length === 0 ? undefined : (stop as string[]);
   }
   throw new ChatGPTOAuthInvalidRequestError("stop must be a string or an array of strings");
 }

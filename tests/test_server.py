@@ -4093,7 +4093,7 @@ def test_messages_count_tokens_accepts_disabled_thinking_with_live_catalog(clien
     "route",
     ["/v1/messages", "/v1/messages/count_tokens", "/v1/messages/compact"],
 )
-def test_anthropic_routes_reject_hosted_web_search_before_catalog_or_provider(
+def test_anthropic_routes_reject_unsupported_web_search_blocked_domains_before_catalog_or_provider(
     client,
     recording_backend: RecordingBackend,
     route,
@@ -4101,15 +4101,21 @@ def test_anthropic_routes_reject_hosted_web_search_before_catalog_or_provider(
     response = client.post(
         route,
         json={
-            "model": "gpt-5.6-sol",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "search the web"}],
-            "tools": [{"type": "web_search_20260209", "name": "web_search"}],
+            "tools": [
+                {
+                    "type": "web_search_20260209",
+                    "name": "web_search",
+                    "blocked_domains": ["example.com"],
+                }
+            ],
         },
     )
 
     assert response.status_code == 400
-    assert "cannot be represented losslessly" in response.json()["error"]["message"]
+    assert "blocked_domains" in response.json()["error"]["message"]
     assert recording_backend.catalog_requests.empty()
     assert recording_backend.requests.empty()
 
@@ -4310,6 +4316,8 @@ def test_anthropic_generation_endpoints_require_positive_integer_max_tokens(
     path,
     max_tokens,
 ):
+    if path == "/v1/messages/compact" and max_tokens is None:
+        return
     payload = {
         "model": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": "hello"}],
@@ -4790,15 +4798,18 @@ def test_messages_compact_accepts_anthropic_body(
     assert resp.json() == {"checkpoint": "checkpoint"}
 
 
-def test_messages_compact_rejects_enabled_parallel_tool_use_before_upstream(
+def test_messages_compact_accepts_enabled_parallel_tool_use(
     client,
     recording_backend: RecordingBackend,
+    monkeypatch,
 ):
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod, "MODEL", "gpt-5.5")
     response = client.post(
         "/v1/messages/compact",
         json={
-            "model": "gpt-5.5",
-            "max_tokens": 1024,
+            "model": "claude-sonnet-4-6",
             "system": "system",
             "messages": [{"role": "user", "content": "hello"}],
             "tool_choice": {
@@ -4808,37 +4819,35 @@ def test_messages_compact_rejects_enabled_parallel_tool_use_before_upstream(
         },
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 200
+    assert isinstance(response.json()["checkpoint"], str)
+    assert "compact-checkpoint" in response.json()["checkpoint"]
 
 
-def test_messages_count_tokens_rejects_stop_sequences_before_catalog_or_provider(
+def test_messages_count_tokens_accepts_stop_sequences_and_sampling_controls(
     client,
     recording_backend: RecordingBackend,
 ):
     response = client.post(
         "/v1/messages/count_tokens",
         json={
-            "model": "gpt-5.5",
+            "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "hello"}],
             "stop_sequences": ["stop"],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 10,
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request_error"
-    assert recording_backend.catalog_requests.empty()
-    assert recording_backend.requests.empty()
-    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] > 0
     assert recording_backend.requests.empty()
 
 
 @pytest.mark.parametrize(
     "unsupported",
     [
-        {"stop_sequences": ["stop"]},
-        {"tool_choice": {"type": "any"}},
-        {"tool_choice": {"type": "tool", "name": "lookup"}},
-        {"tool_choice": {"type": "none"}},
         {"subagent": "ignored-agent"},
         {"memgen_request": False},
     ],
@@ -5983,7 +5992,7 @@ def test_anthropic_routes_accept_metadata_and_beta_tool_flags_and_reject_invalid
 
     for invalid_patch in (
         {"metadata": {"user_id": 123}},
-        {"metadata": {"extra": "value"}},
+        {"metadata": {"extra": 123}},
         {"tools": [{"name": "lookup", "input_schema": {"type": "object"}, "defer_loading": True}]},
         {"tools": [{"name": "lookup", "input_schema": {"type": "object"}, "eager_input_streaming": "true"}]},
     ):
@@ -6235,7 +6244,8 @@ def test_anthropic_stream_preflight_returns_json_error_before_upstream_request(
         "error": {
             "type": "invalid_request_error",
             "message": (
-                "Anthropic hosted web_search cannot be represented losslessly by this facade"
+                "Responses Lite cannot execute hosted tools without a standalone runtime: "
+                "web_search; set CODEX_AS_API_RESPONSES_LITE=off to use classic Responses"
             ),
         },
     }
@@ -6708,7 +6718,7 @@ def test_dynamic_npm_version_resolver_updates_models_query_user_agent_and_cold_f
     responses_req_1 = recording_backend.requests.get(timeout=1)
     assert catalog_req_1["path"] == "/models?client_version=0.175.2"
     assert catalog_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
-    assert catalog_req_1["headers"]["user-agent"].endswith(") codex-as-api/0.10.2")
+    assert catalog_req_1["headers"]["user-agent"].endswith(") codex-as-api/1.0.0")
     assert responses_req_1["headers"]["user-agent"].startswith("codex_cli_rs/0.175.2 (")
 
     active_version = "0.176.0"
@@ -6752,3 +6762,281 @@ def test_dynamic_npm_version_resolver_updates_models_query_user_agent_and_cold_f
         err_resp = test_client.post(path, json=body)
         assert err_resp.status_code == 503
         assert err_resp.headers["content-type"].startswith("application/json")
+
+
+def test_openai_responses_and_responses_compact_endpoints(
+    client,
+    recording_backend: RecordingBackend,
+):
+    non_stream = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.5",
+            "instructions": "Be concise.",
+            "input": "Hello native responses",
+            "store": False,
+            "user": "sdk-user-1",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup_doc",
+                    "description": "Look up documentation",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+    assert non_stream.status_code == 200
+    payload = non_stream.json()
+    assert payload["object"] == "response"
+    assert payload["output_text"] == "backend-ok"
+
+    stream_resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "Stream native responses"}],
+            "stream": True,
+        },
+    )
+    assert stream_resp.status_code == 200
+    assert "event: response.completed" in stream_resp.text
+
+    compact_resp = client.post(
+        "/v1/responses/compact",
+        json={
+            "model": "gpt-5.5",
+            "instructions": "Compact context",
+            "input": [{"role": "user", "content": "Hello compact"}],
+        },
+    )
+    assert compact_resp.status_code == 200
+    assert compact_resp.json()["object"] == "response.compaction"
+    assert isinstance(compact_resp.json()["output"], list)
+
+
+def test_openai_responses_parity_headers_nulls_summary_and_stream_error(
+    client,
+    recording_backend: RecordingBackend,
+    monkeypatch,
+):
+    while not recording_backend.requests.empty():
+        recording_backend.requests.get_nowait()
+
+    first = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.5",
+            "input": "Turn 1",
+            "instructions": None,
+            "store": None,
+            "stream_options": None,
+            "reasoning": {"summary": "concise"},
+            "subagent": "planner",
+            "memgen_request": True,
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["id"]
+    req1 = recording_backend.requests.get(timeout=1)
+    assert req1["headers"]["x-openai-subagent"] == "planner"
+    assert req1["headers"]["x-openai-memgen-request"] == "true"
+    assert req1["body"]["reasoning"]["summary"] == "concise"
+
+    second = client.post(
+        "/v1/responses",
+        headers={"x-openai-subagent": "worker", "x-openai-memgen-request": "false"},
+        json={
+            "model": "gpt-5.5",
+            "input": [],
+            "previous_response_id": first_id,
+            "stream": True,
+            "stream_options": {"include_usage": None},
+            "tools": [{"type": "web_search_preview_2025_03_11"}],
+        },
+    )
+    assert second.status_code == 200, second.text
+    req2 = recording_backend.requests.get(timeout=1)
+    assert req2["headers"]["x-openai-subagent"] == "worker"
+    assert req2["headers"]["x-openai-memgen-request"] == "false"
+    assert req2["body"]["tools"] == [{"type": "web_search"}]
+
+    compact = client.post(
+        "/v1/responses/compact",
+        json={
+            "model": "gpt-5.5",
+            "instructions": None,
+            "input": [],
+            "previous_response_id": first_id,
+            "reasoning": {"summary": "detailed"},
+        },
+    )
+    assert compact.status_code == 200, compact.text
+    compact_req = recording_backend.requests.get(timeout=1)
+    assert compact_req["body"]["reasoning"]["summary"] == "detailed"
+    assert len(compact.json()["output"]) == 3
+
+    meta_msg = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "metadata": {"user_id": "u1", "trace_tag": "ok", "nullable_tag": None},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert meta_msg.status_code == 200, meta_msg.text
+
+    def failing_sse(_path: str, _payload: dict[str, object], extra_headers=None, catalog_key=None):
+        del extra_headers, catalog_key
+        yield {"type": "response.created", "response": {"id": "resp_fail", "status": "in_progress"}}
+        raise RuntimeError("mid-stream boom")
+
+    import codex_as_api.server as server_mod
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", failing_sse)
+    failed_stream = client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.5", "input": "trigger error", "stream": True},
+    )
+    assert failed_stream.status_code == 200
+    assert "event: error\n" in failed_stream.text
+    assert '"type": "error"' in failed_stream.text
+    assert "data: [DONE]" not in failed_stream.text
+
+
+def test_web_search_open_page_and_find_in_page_across_endpoints(client, monkeypatch):
+    import codex_as_api.server as server_mod
+
+    search_item = {
+        "type": "web_search_call",
+        "id": "ws_search",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": "codex web search",
+            "sources": [{"url": "https://example.test/doc", "title": "Doc"}],
+        },
+    }
+    open_page_item = {
+        "type": "web_search_call",
+        "id": "ws_open",
+        "status": "completed",
+        "action": {"type": "open_page", "url": "https://example.test/doc"},
+    }
+    find_item = {
+        "type": "web_search_call",
+        "id": "ws_find",
+        "status": "completed",
+        "action": {"type": "find_in_page", "pattern": "needle", "url": None},
+    }
+    message_item = {
+        "type": "message",
+        "id": "msg_done",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Found it."}],
+    }
+
+    def fake_sse(_path: str, _payload: dict[str, object], extra_headers=None, catalog_key=None):
+        del extra_headers, catalog_key
+        yield {"type": "response.created", "response": {"id": "resp_ws_pages", "status": "in_progress"}}
+        for item in (search_item, open_page_item, find_item):
+            yield {"type": "response.output_item.added", "item": {"type": "web_search_call", "status": "in_progress"}}
+            yield {"type": "response.output_item.done", "item": item}
+        yield {"type": "response.output_text.delta", "delta": "Found it."}
+        yield {"type": "response.output_item.done", "item": message_item}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_ws_pages",
+                "output": [search_item, open_page_item, find_item, message_item],
+                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            },
+        }
+
+    monkeypatch.setattr(server_mod._provider, "_post_sse", fake_sse)
+
+    responses_res = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.5",
+            "input": "Inspect docs",
+            "tools": [{"type": "web_search"}],
+        },
+    )
+    assert responses_res.status_code == 200, responses_res.text
+    responses_body = responses_res.json()
+    assert [item["id"] for item in responses_body["output"]] == ["ws_search", "ws_open", "ws_find", "msg_done"]
+    assert responses_body["output"][1]["action"] == {"type": "open_page", "url": "https://example.test/doc"}
+    assert responses_body["output"][2]["action"] == {"type": "find_in_page", "pattern": "needle", "url": None}
+
+    responses_stream = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.5",
+            "input": "Inspect docs",
+            "tools": [{"type": "web_search"}],
+            "stream": True,
+        },
+    )
+    assert responses_stream.status_code == 200, responses_stream.text
+    assert '"type": "open_page"' in responses_stream.text or '"type":"open_page"' in responses_stream.text
+    assert '"type": "find_in_page"' in responses_stream.text or '"type":"find_in_page"' in responses_stream.text
+
+    msg_res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": "Inspect docs"}],
+        },
+    )
+    assert msg_res.status_code == 200, msg_res.text
+    msg_body = msg_res.json()
+    server_uses = [block for block in msg_body["content"] if block["type"] == "server_tool_use"]
+    assert [block["input"]["query"] for block in server_uses] == [
+        "codex web search",
+        "open_page: https://example.test/doc",
+        "find_in_page: needle",
+    ]
+    assert msg_body["usage"]["server_tool_use"]["web_search_requests"] == 3
+
+    replay_res = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [
+                {"role": "user", "content": "Inspect docs"},
+                {"role": "assistant", "content": msg_body["content"]},
+                {"role": "user", "content": "Summarize it."},
+            ],
+        },
+    )
+    assert replay_res.status_code == 200, replay_res.text
+
+    msg_stream = client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": True,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": "Inspect docs"}],
+        },
+    )
+    assert msg_stream.status_code == 200, msg_stream.text
+    assert "open_page: https://example.test/doc" in msg_stream.text
+    assert "find_in_page: needle" in msg_stream.text
+
+    chat_res = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "Inspect docs"}],
+        },
+    )
+    assert chat_res.status_code == 502
+    assert chat_res.json()["error"]["type"] == "upstream_protocol_error"

@@ -177,6 +177,44 @@ def decode_reasoning_signature(signature: str) -> dict[str, Any]:
     }
 
 
+def validate_replayable_reasoning_item(raw_item: object) -> dict[str, Any]:
+    if not isinstance(raw_item, Mapping):
+        raise ValueError("Invalid thinking signature: item must be an object")
+    unsupported = set(raw_item.keys()) - {"type", "id", "encrypted_content", "summary"}
+    if unsupported:
+        raise ValueError("Invalid thinking signature: unsupported item field")
+    if raw_item.get("type") != "reasoning":
+        raise ValueError("Invalid thinking signature: item.type must be 'reasoning'")
+
+    canonical_item: dict[str, Any] = {"type": "reasoning"}
+    if "id" in raw_item:
+        item_id = raw_item["id"]
+        if not isinstance(item_id, str) or not item_id:
+            raise ValueError("Invalid thinking signature: item.id must be a non-empty string when present")
+        canonical_item["id"] = item_id
+
+    encrypted_content = raw_item.get("encrypted_content")
+    if not isinstance(encrypted_content, str) or not encrypted_content:
+        raise ValueError("Invalid thinking signature: item.encrypted_content must be a non-empty string")
+    canonical_item["encrypted_content"] = encrypted_content
+
+    raw_summary = raw_item.get("summary")
+    if not isinstance(raw_summary, list):
+        raise ValueError("Invalid thinking signature: item.summary must be an array")
+    normalized_summary: list[dict[str, str]] = []
+    for part in raw_summary:
+        if not isinstance(part, Mapping):
+            raise ValueError("Invalid thinking signature: summary entry must be an object")
+        if set(part.keys()) - {"type", "text"}:
+            raise ValueError("Invalid thinking signature: unsupported summary field")
+        if part.get("type") != "summary_text" or not isinstance(part.get("text"), str):
+            raise ValueError("Invalid thinking signature: summary entry must be {type:'summary_text', text:string}")
+        normalized_summary.append({"type": "summary_text", "text": part["text"]})
+
+    canonical_item["summary"] = normalized_summary
+    return canonical_item
+
+
 def extract_reasoning_item_for_model(
     entry: Mapping[str, Any],
     *,

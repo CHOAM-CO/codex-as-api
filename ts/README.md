@@ -111,10 +111,11 @@ claude
 
 Run `/model` and select **GPT-5.6 Sol**. Change `ANTHROPIC_CUSTOM_MODEL_OPTION` to another ID returned by `/v1/models` when needed. Any live Codex ID can also be selected directly with the same base URL and token variables, for example `ANTHROPIC_BASE_URL=http://127.0.0.1:18080 ANTHROPIC_AUTH_TOKEN=unused claude --model gpt-5.6-terra --effort high`.
 
-Hosted Anthropic WebSearch is rejected on Messages, token-counting, and compact
-requests. OpenAI hosted search results do not carry the Anthropic provenance and
-encrypted lifecycle data required for a lossless Messages response, and classic
-Responses does not change that limitation. WebFetch remains a client-side
+Hosted Anthropic WebSearch (`web_search`, `web_search_20250305`, `web_search_20260209`)
+is supported on Classic Responses and translates Codex `web_search_call` items (`search`,
+`open_page`, and `find_in_page` actions) and sources into `server_tool_use` and
+`web_search_tool_result` blocks (while rejecting
+`blocked_domains`, `strict: true`, or explicit Responses Lite mode). WebFetch remains a client-side
 auxiliary request; call-level disabled thinking wins over ambient effort and uses the selected model's least reasoning level (`none` when supported, otherwise the lowest advertised level). Explicit unsupported OpenAI effort requests still return 400.
 
 Final responses require authoritative provider usage and a real

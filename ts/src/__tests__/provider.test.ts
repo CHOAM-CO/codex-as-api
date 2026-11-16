@@ -10,6 +10,8 @@ import {
   splitInstructionsAndInput,
   messagesToResponseItems,
   messageItem,
+  normalizeNativeResponsesInput,
+  normalizeNativeResponsesTools,
   toolSchemaToResponseDict,
   setReasoningPayload,
   toolCallFromResponseItem,
@@ -3196,7 +3198,7 @@ describe("Codex CLI request headers", () => {
 
     assert.equal(headers.originator, "codex_cli_rs");
     assert.ok(headers["User-Agent"].startsWith("codex_cli_rs/0.164.0 ("));
-    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/0.10.2"));
+    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/1.0.0"));
 
     const dynamicHeaders = codexCliHeadersForVersion("1.2.3");
     assert.equal(dynamicHeaders.originator, "codex_cli_rs");
@@ -3963,8 +3965,10 @@ describe("webSearchEventFromResponseItem", () => {
       { type: "search", query: "first", queries: ["second"], sources: [] },
       { type: "search", sources: [] },
       { type: "search", queries: [], sources: [] },
-      { type: "open_page", url: "https://example.com", sources: [] },
-      { type: "find_in_page", pattern: "needle", sources: [] },
+      { type: "open_page", url: 123 },
+      { type: "open_page", url: "https://example.com", sources: "bad" },
+      { type: "find_in_page", pattern: 123 },
+      { type: "find_in_page", pattern: "needle", url: 123 },
       { type: "future", sources: [] },
       { type: "search", query: "hello", sources: [{ url: "https://example.com", page_age: 1 }] },
     ]) {
@@ -3975,6 +3979,79 @@ describe("webSearchEventFromResponseItem", () => {
           action,
         }),
         ChatGPTOAuthProtocolError,
+      );
+    }
+  });
+
+  it("projects open_page and find_in_page actions with optional sources and nullable fields", () => {
+    const cases: Array<{
+      action: Record<string, unknown>;
+      expectedQuery: string;
+      expectedContent: Record<string, unknown>[];
+    }> = [
+      {
+        action: { type: "open_page", url: "https://example.com" },
+        expectedQuery: "open_page: https://example.com",
+        expectedContent: [],
+      },
+      {
+        action: { type: "open_page", url: null, sources: null },
+        expectedQuery: "open_page",
+        expectedContent: [],
+      },
+      {
+        action: {
+          type: "open_page",
+          url: "   ",
+          sources: [{ url: "https://example.com", title: "Example" }],
+        },
+        expectedQuery: "open_page",
+        expectedContent: [{ type: "web_search_result", url: "https://example.com", title: "Example" }],
+      },
+      {
+        action: { type: "find_in_page", pattern: "needle", url: "https://example.com" },
+        expectedQuery: "find_in_page: needle (https://example.com)",
+        expectedContent: [],
+      },
+      {
+        action: { type: "find_in_page", pattern: "needle", url: null, sources: null },
+        expectedQuery: "find_in_page: needle",
+        expectedContent: [],
+      },
+      {
+        action: { type: "find_in_page", url: "https://example.com" },
+        expectedQuery: "find_in_page: https://example.com",
+        expectedContent: [],
+      },
+      {
+        action: { type: "find_in_page", pattern: "", url: "   " },
+        expectedQuery: "find_in_page",
+        expectedContent: [],
+      },
+      {
+        action: {
+          type: "find_in_page",
+          pattern: "needle",
+          sources: [{ url: "https://example.com", page_age: "1d" }],
+        },
+        expectedQuery: "find_in_page: needle",
+        expectedContent: [{ type: "web_search_result", url: "https://example.com", page_age: "1d" }],
+      },
+    ];
+
+    for (const { action, expectedQuery, expectedContent } of cases) {
+      assert.deepEqual(
+        webSearchEventFromResponseItem({
+          type: "web_search_call",
+          id: "ws_page_1",
+          action,
+        }),
+        {
+          type: "web_search_call",
+          id: "ws_page_1",
+          input: { query: expectedQuery },
+          content: expectedContent,
+        },
       );
     }
   });
@@ -3999,6 +4076,8 @@ describe("webSearchEventFromResponseItem", () => {
     for (const [action, expected] of [
       [{ query: "direct", queries: null, sources: [] }, "direct"],
       [{ query: null, queries: ["fallback"], sources: [] }, "fallback"],
+      [{ query: null, queries: ["first", "second"], sources: [] }, "first | second"],
+      [{ query: "first", queries: ["first", "second"], sources: [] }, "first | second"],
       [{ query: "", sources: [] }, ""],
       [{ query: "same", queries: ["same"], sources: [] }, "same"],
     ] as const) {
@@ -4920,5 +4999,176 @@ describe("Codex session headers (prompt cache routing)", () => {
       globalThis.fetch = originalFetch;
       fs.rmSync(path.dirname(authPath), { recursive: true, force: true });
     }
+  });
+});
+
+describe("Native /v1/responses parity", () => {
+  it("normalizes allowEmpty input, filters incompatible reasoning models, and validates tools", () => {
+    assert.deepEqual(normalizeNativeResponsesInput([], "gpt-5.6-sol", true), []);
+    assert.throws(
+      () => normalizeNativeResponsesInput([], "gpt-5.6-sol", false),
+      ChatGPTOAuthInvalidRequestError,
+    );
+
+    const mixedReasoning = normalizeNativeResponsesInput(
+      [
+        {
+          type: "reasoning",
+          id: "rs_keep",
+          model: "gpt-5.6-sol",
+          encrypted_content: "enc_keep",
+          summary: [{ type: "summary_text", text: "keep" }],
+        },
+        {
+          type: "reasoning",
+          id: "rs_drop",
+          model: "gpt-5.5",
+          encrypted_content: "enc_drop",
+          summary: [],
+        },
+      ],
+      "gpt-5.6-sol",
+      false,
+    );
+    assert.deepEqual(mixedReasoning, [
+      {
+        type: "reasoning",
+        id: "rs_keep",
+        encrypted_content: "enc_keep",
+        summary: [{ type: "summary_text", text: "keep" }],
+      },
+    ]);
+    assert.throws(
+      () => normalizeNativeResponsesInput(
+        [{ type: "reasoning", id: "rs_bad", model: " gpt-5.6-sol ", encrypted_content: "enc" }],
+        "gpt-5.6-sol",
+        false,
+      ),
+      ChatGPTOAuthInvalidRequestError,
+    );
+
+    const normalizedTools = normalizeNativeResponsesTools([
+      {
+        type: "function",
+        function: {
+          name: "nested_fn",
+          description: "Nested fn",
+          parameters: { type: "object", properties: { q: { type: "string" } } },
+          strict: true,
+        },
+      },
+      { type: "web_search_preview", search_context_size: "low" },
+      { type: "web_search_preview_2025_03_11" },
+    ]);
+    assert.deepEqual(normalizedTools, [
+      {
+        type: "function",
+        name: "nested_fn",
+        description: "Nested fn",
+        parameters: { type: "object", properties: { q: { type: "string" } } },
+        strict: true,
+      },
+      { type: "web_search", search_context_size: "low" },
+      { type: "web_search" },
+    ]);
+
+    for (const badTool of [
+      [{ type: "function", function: "bad" }],
+      [{ type: "function", name: "f", parameters: "bad" }],
+      [{ type: "function", name: "f", strict: "yes" }],
+      [{ type: "code_interpreter" }],
+    ]) {
+      assert.throws(
+        () => normalizeNativeResponsesTools(badTool),
+        ChatGPTOAuthInvalidRequestError,
+      );
+    }
+  });
+
+  it("commits response.completed.output fallback for input: [] continuation and preserves compact items", async () => {
+    const provider = testProvider();
+    const seenPayloads: Record<string, unknown>[] = [];
+    let callIdx = 0;
+
+    (provider as unknown as {
+      postSSE(path: string, payload: Record<string, unknown>): AsyncGenerator<Record<string, unknown>>;
+    }).postSSE = async function* (_path, payload) {
+      seenPayloads.push(payload);
+      callIdx += 1;
+      if (callIdx === 1) {
+        yield {
+          type: "response.completed",
+          response: {
+            id: "resp_completed_only",
+            object: "response",
+            status: "completed",
+            output: [{
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "from completed output" }],
+            }],
+          },
+        };
+        return;
+      }
+      yield {
+        type: "response.completed",
+        response: {
+          id: "resp_continued",
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "continued ok" }],
+          }],
+        },
+      };
+    };
+
+    const first = await provider.createResponse({ model: "gpt-5.5", input: "Turn 1" });
+    assert.equal(first.id, "resp_completed_only");
+    const second = await provider.createResponse({
+      model: "gpt-5.5",
+      input: [],
+      previousResponseId: "resp_completed_only",
+    });
+    assert.equal(second.id, "resp_continued");
+    assert.deepEqual(seenPayloads[1].input, [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Turn 1" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "from completed output" }],
+      },
+    ]);
+
+    (provider as unknown as {
+      postJSON(path: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+    }).postJSON = async (_path, payload) => {
+      seenPayloads.push(payload);
+      return {
+        output: [
+          { type: "additional_tools", role: "developer", tools: [] },
+          { type: "reasoning", id: "rs_c1", summary: [{ type: "summary_text", text: "kept" }] },
+          { type: "function_call", call_id: "call_c1", name: "lookup", arguments: "{}" },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
+        ],
+      };
+    };
+
+    const compacted = await provider.compactResponses({
+      model: "gpt-5.5",
+      input: [],
+      previousResponseId: "resp_continued",
+      reasoningSummary: "concise",
+    });
+    assert.equal((compacted.reasoning as Record<string, unknown> | undefined)?.summary, undefined);
+    assert.equal((seenPayloads.at(-1)?.reasoning as Record<string, unknown>)?.summary, "concise");
+    assert.equal((compacted.output as unknown[]).length, 4);
   });
 });

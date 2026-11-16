@@ -55,6 +55,7 @@ def anthropic_request_to_internal(
         not isinstance(stop_sequences, list) or any(not isinstance(value, str) or not value for value in stop_sequences)
     ):
         raise ValueError("stop_sequences must be an array of non-empty strings")
+    normalized_stop_sequences = stop_sequences if stop_sequences else None
     internal_messages: list[Message] = []
 
     # System prompt → SYSTEM message
@@ -86,7 +87,7 @@ def anthropic_request_to_internal(
     reasoning_effort = _convert_reasoning_effort(thinking, output_config, max_tokens)
     text = _convert_output_format(output_format, output_config)
 
-    return internal_messages, internal_tools, internal_tool_choice, stop_sequences, reasoning_effort, text
+    return internal_messages, internal_tools, internal_tool_choice, normalized_stop_sequences, reasoning_effort, text
 
 
 def _extract_system_text(system: str | list[dict[str, Any]]) -> str:
@@ -326,13 +327,10 @@ def _convert_assistant_message(
             data = block.get("data")
             if not isinstance(data, str):
                 raise ValueError(f"Anthropic assistant redacted_thinking block {index} requires string data")
-        elif block_type in {
-            "server_tool_use",
-            "web_search_tool_result",
-        }:
-            raise ValueError(
-                f"Anthropic assistant content block type {block_type!r} cannot be preserved by this facade"
-            )
+        elif block_type == "server_tool_use":
+            text_parts.append(_render_server_tool_use_block(block))
+        elif block_type == "web_search_tool_result":
+            text_parts.append(_render_web_search_tool_result_block(block))
         else:
             text_parts.append(_render_anthropic_content_block(block))
     out.append(
@@ -374,10 +372,10 @@ def _convert_tools(tools: object) -> list[ToolSchema]:
         name = tool.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"Anthropic tool {index} requires a non-empty name")
-        if _is_anthropic_web_search_tool(tool):
-            raise ValueError(
-                "Anthropic hosted web_search cannot be represented losslessly by this facade"
-            )
+        web_search_tool = _convert_anthropic_web_search_tool(tool, index)
+        if web_search_tool is not None:
+            result.append(web_search_tool)
+            continue
         tool_type = tool.get("type", "custom")
         if tool_type is not None and tool_type != "custom":
             raise ValueError(f"Anthropic tool {index} type must be 'custom' or null")
@@ -455,12 +453,105 @@ def _required_tool_schema(tool: dict[str, Any], index: int) -> dict[str, Any]:
     return schema
 
 
-def _is_anthropic_web_search_tool(tool: dict[str, Any]) -> bool:
-    return (
-        tool.get("name") == "web_search"
-        and isinstance(tool.get("type"), str)
-        and tool["type"] in {"web_search", "web_search_20250305", "web_search_20260209"}
+def _convert_anthropic_web_search_tool(tool: dict[str, Any], index: int) -> ToolSchema | None:
+    if (
+        tool.get("name") != "web_search"
+        or not isinstance(tool.get("type"), str)
+        or tool["type"] not in {"web_search", "web_search_20250305", "web_search_20260209"}
+    ):
+        return None
+    _reject_unknown_fields(
+        tool,
+        {
+            "type",
+            "name",
+            "allowed_domains",
+            "blocked_domains",
+            "max_uses",
+            "strict",
+            "user_location",
+            "defer_loading",
+            "eager_input_streaming",
+            "allowed_callers",
+            "output_schema",
+        },
+        f"Anthropic tool {index}",
     )
+    if "strict" in tool and tool["strict"] is not None and not isinstance(tool["strict"], bool):
+        raise ValueError(f"Anthropic tool {index} strict must be a boolean or null")
+    if tool.get("strict") is True:
+        raise ValueError(
+            f"Anthropic tool {index} web_search strict mode is not supported by the Codex OAuth transport"
+        )
+    if tool.get("blocked_domains") is not None:
+        raise ValueError(
+            f"Anthropic tool {index} web_search blocked_domains is not supported by the Codex OAuth transport"
+        )
+    max_uses = tool.get("max_uses")
+    if max_uses is not None and (not isinstance(max_uses, int) or isinstance(max_uses, bool) or max_uses <= 0):
+        raise ValueError(f"Anthropic tool {index} web_search max_uses must be a positive integer")
+    openai_tool: dict[str, Any] = {"type": "web_search"}
+    allowed_domains = tool.get("allowed_domains")
+    if allowed_domains is not None:
+        if (
+            not isinstance(allowed_domains, list)
+            or not allowed_domains
+            or any(not isinstance(domain, str) or not domain.strip() for domain in allowed_domains)
+        ):
+            raise ValueError(
+                f"Anthropic tool {index} web_search allowed_domains must be a non-empty array of strings"
+            )
+        openai_tool["filters"] = {"allowed_domains": list(allowed_domains)}
+    user_location = tool.get("user_location")
+    if user_location is not None:
+        openai_tool["user_location"] = _normalize_web_search_user_location(
+            user_location,
+            f"Anthropic tool {index} web_search user_location",
+        )
+    return ToolSchema(
+        name="web_search",
+        description=None,
+        parameters={
+            "__codex_as_api_tool_type": "web_search",
+            "openai_tool": openai_tool,
+        },
+    )
+
+
+def _normalize_web_search_user_location(value: object, location: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{location} must be an object")
+    _reject_unknown_fields(
+        value,
+        {"type", "city", "country", "region", "timezone"},
+        location,
+    )
+    if value.get("type") != "approximate":
+        raise ValueError(f"{location}.type must be approximate")
+    out: dict[str, str] = {"type": "approximate"}
+    city = _optional_non_empty_string(value.get("city"), f"{location}.city")
+    country = _optional_non_empty_string(value.get("country"), f"{location}.country")
+    region = _optional_non_empty_string(value.get("region"), f"{location}.region")
+    timezone = _optional_non_empty_string(value.get("timezone"), f"{location}.timezone")
+    if city is not None:
+        out["city"] = city
+    if country is not None:
+        if len(country) != 2 or not country.isascii() or not country.isalpha():
+            raise ValueError(f"{location}.country must be a two-letter ISO country code")
+        out["country"] = country
+    if region is not None:
+        out["region"] = region
+    if timezone is not None:
+        out["timezone"] = timezone
+    return out
+
+
+def _optional_non_empty_string(value: object, location: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{location} must be a non-empty string")
+    return value
 
 
 def _convert_tool_choice(tc: dict[str, Any] | None) -> str | dict | None:
@@ -486,9 +577,7 @@ def _convert_tool_choice(tc: dict[str, Any] | None) -> str | dict | None:
         if not isinstance(name, str) or not name:
             raise ValueError("tool_choice.name must be a non-empty string")
         if name == "web_search":
-            raise ValueError(
-                "Anthropic hosted web_search cannot be represented losslessly by this facade"
-            )
+            return {"type": "web_search"}
         return {"type": "function", "name": name}
     if tc_type == "none":
         return "none"
@@ -511,10 +600,9 @@ def validate_anthropic_metadata(metadata: object) -> None:
         return
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
-    _reject_unknown_fields(metadata, {"user_id"}, "metadata")
-    user_id = metadata.get("user_id")
-    if user_id is not None and not isinstance(user_id, str):
-        raise ValueError("metadata.user_id must be a string")
+    for key, value in metadata.items():
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"metadata.{key} must be a string")
 
 
 def resolve_anthropic_thinking_options(
@@ -679,9 +767,177 @@ def _render_anthropic_content_block(block: dict[str, Any]) -> str:
     typ = block.get("type")
     if not isinstance(typ, str) or not typ:
         raise ValueError("Anthropic content block requires a non-empty type")
-    if typ in {"document", "search_result"}:
-        raise ValueError(f"Anthropic content block type {typ!r} cannot be preserved by this facade")
+    if typ == "document":
+        return _render_document_block(block)
+    if typ == "search_result":
+        return _render_search_result_block(block)
     raise ValueError(f"Anthropic content block type {typ!r} is not supported by this facade")
+
+
+def _render_document_block(block: dict[str, Any]) -> str:
+    _validate_nullable_unrepresentable_field(block, "citations", "Anthropic document block")
+    _reject_unknown_fields(
+        block,
+        {"type", "source", "title", "context", "citations"},
+        "Anthropic document block",
+    )
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("Anthropic document block source must be an object")
+    source_type = source.get("type")
+    title = _optional_non_empty_string(block.get("title"), "Anthropic document block.title")
+    context = _optional_non_empty_string(block.get("context"), "Anthropic document block.context")
+    if source_type == "text":
+        _reject_unknown_fields(
+            source,
+            {"type", "media_type", "data"},
+            "Anthropic document block.source",
+        )
+        media_type = source.get("media_type")
+        if media_type is not None and media_type != "text/plain":
+            raise ValueError("Anthropic text document source media_type must be text/plain")
+        data = source.get("data")
+        if not isinstance(data, str):
+            raise ValueError("Anthropic text document source requires string data")
+        return _format_document_text(data, title, context)
+    if source_type == "content":
+        _reject_unknown_fields(
+            source,
+            {"type", "content"},
+            "Anthropic document block.source",
+        )
+        raw_content = source.get("content")
+        if isinstance(raw_content, str):
+            return _format_document_text(raw_content, title, context)
+        if not isinstance(raw_content, list) or not raw_content:
+            raise ValueError(
+                "Anthropic content document source requires a string or non-empty content array"
+            )
+        parts: list[str] = []
+        for index, item in enumerate(raw_content):
+            if not isinstance(item, dict):
+                raise ValueError(f"Anthropic document content[{index}] must be an object")
+            if item.get("type") != "text":
+                raise ValueError(f"Anthropic document content[{index}] must be a text block")
+            _validate_nullable_unrepresentable_field(
+                item,
+                "citations",
+                f"Anthropic document content[{index}]",
+            )
+            _reject_unknown_fields(
+                item,
+                {"type", "text", "citations"},
+                f"Anthropic document content[{index}]",
+            )
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ValueError(f"Anthropic document content[{index}] requires string text")
+            parts.append(text)
+        return _format_document_text("".join(parts), title, context)
+    raise ValueError(f"Anthropic document source type {source_type!r} is not supported by this facade")
+
+
+def _format_document_text(body: str, title: str | None, context: str | None) -> str:
+    header_parts = ["[document"]
+    if title is not None:
+        header_parts.append(f" title={json.dumps(title, ensure_ascii=False)}")
+    if context is not None:
+        header_parts.append(f" context={json.dumps(context, ensure_ascii=False)}")
+    header_parts.append("]")
+    return f"{''.join(header_parts)}\n{body}\n[/document]"
+
+
+def _render_search_result_block(block: dict[str, Any]) -> str:
+    _validate_nullable_unrepresentable_field(block, "citations", "Anthropic search_result block")
+    _reject_unknown_fields(
+        block,
+        {"type", "source", "url", "title", "content", "citations"},
+        "Anthropic search_result block",
+    )
+    raw_source = block.get("source") if "source" in block else block.get("url")
+    source = _optional_non_empty_string(raw_source, "Anthropic search_result block.source")
+    title = _optional_non_empty_string(block.get("title"), "Anthropic search_result block.title")
+    if source is None or title is None:
+        raise ValueError("Anthropic search_result block requires non-empty source and title")
+    content = block.get("content")
+    if isinstance(content, str):
+        body = content
+    elif isinstance(content, list) and content:
+        parts: list[str] = []
+        for index, item in enumerate(content):
+            if not isinstance(item, dict):
+                raise ValueError(f"Anthropic search_result content[{index}] must be an object")
+            if item.get("type") != "text":
+                raise ValueError(f"Anthropic search_result content[{index}] must be a text block")
+            _validate_nullable_unrepresentable_field(
+                item,
+                "citations",
+                f"Anthropic search_result content[{index}]",
+            )
+            _reject_unknown_fields(
+                item,
+                {"type", "text", "citations"},
+                f"Anthropic search_result content[{index}]",
+            )
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ValueError(f"Anthropic search_result content[{index}] requires string text")
+            parts.append(text)
+        body = "".join(parts)
+    else:
+        raise ValueError("Anthropic search_result block requires a string or non-empty content array")
+    return (
+        f"[search_result source={json.dumps(source, ensure_ascii=False)} "
+        f"title={json.dumps(title, ensure_ascii=False)}]\n"
+        f"{body}\n[/search_result]"
+    )
+
+
+def _render_server_tool_use_block(block: dict[str, Any]) -> str:
+    _reject_unknown_fields(
+        block,
+        {"type", "id", "name", "input", "caller"},
+        "Anthropic server_tool_use block",
+    )
+    _validate_direct_tool_caller(block, "Anthropic server_tool_use block")
+    tool_id = _optional_non_empty_string(block.get("id"), "Anthropic server_tool_use block.id")
+    name = _optional_non_empty_string(block.get("name"), "Anthropic server_tool_use block.name")
+    if tool_id is None or name is None:
+        raise ValueError("Anthropic server_tool_use block requires non-empty id and name")
+    if name != "web_search":
+        raise ValueError(f"Anthropic server_tool_use name {name!r} is not supported by this facade")
+    tool_input = block.get("input")
+    if not isinstance(tool_input, dict):
+        raise ValueError("Anthropic server_tool_use block.input must be an object")
+    return (
+        f"[server_tool_use id={json.dumps(tool_id, ensure_ascii=False)} "
+        f"name={json.dumps(name, ensure_ascii=False)} "
+        f"input={json.dumps(tool_input, ensure_ascii=False, separators=(',', ':'))}]"
+    )
+
+
+def _render_web_search_tool_result_block(block: dict[str, Any]) -> str:
+    _reject_unknown_fields(
+        block,
+        {"type", "tool_use_id", "content", "caller"},
+        "Anthropic web_search_tool_result block",
+    )
+    _validate_direct_tool_caller(block, "Anthropic web_search_tool_result block")
+    tool_use_id = _optional_non_empty_string(
+        block.get("tool_use_id"),
+        "Anthropic web_search_tool_result block.tool_use_id",
+    )
+    if tool_use_id is None:
+        raise ValueError("Anthropic web_search_tool_result block requires non-empty tool_use_id")
+    content = block.get("content")
+    if not isinstance(content, (list, dict)):
+        raise ValueError(
+            "Anthropic web_search_tool_result block requires a content array or error object"
+        )
+    return (
+        f"[web_search_tool_result tool_use_id={json.dumps(tool_use_id, ensure_ascii=False)}]\n"
+        f"{json.dumps(content, ensure_ascii=False, separators=(',', ':'))}\n[/web_search_tool_result]"
+    )
 
 
 def _validate_nullable_unrepresentable_field(
@@ -689,8 +945,19 @@ def _validate_nullable_unrepresentable_field(
     field: str,
     location: str,
 ) -> None:
-    if field in value and value[field] is not None:
-        raise ValueError(f"{location}.{field} cannot be preserved by this facade")
+    if field not in value or value[field] is None:
+        return
+    if field == "citations":
+        citations = value[field]
+        if isinstance(citations, list) and not citations:
+            return
+        if (
+            isinstance(citations, dict)
+            and set(citations) == {"enabled"}
+            and citations.get("enabled") is False
+        ):
+            return
+    raise ValueError(f"{location}.{field} cannot be preserved by this facade")
 
 
 def _validate_direct_tool_caller(block: dict[str, Any], location: str) -> None:
@@ -761,7 +1028,7 @@ def internal_response_to_anthropic(
         raise ValueError("backend_model must be a non-empty string when provided")
     content: list[dict[str, Any]] = []
 
-    _reject_unrepresentable_response_events(response.raw)
+    raw_events = _raw_response_events(response.raw)
 
     visible_reasoning_parts: list[str] = []
     if not thinking_disabled:
@@ -803,6 +1070,39 @@ def internal_response_to_anthropic(
         elif thinking_display == "summarized" and response.reasoning_content:
             content.append({"type": "thinking", "thinking": response.reasoning_content})
 
+    web_search_requests = 0
+    for event in raw_events:
+        if event.get("type") != "web_search_call":
+            continue
+        call_id = event.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            raise ChatGPTOAuthProtocolError("provider web_search_call event requires a non-empty string id")
+        raw_input = event.get("input")
+        query = raw_input.get("query") if isinstance(raw_input, dict) else event.get("query")
+        if not isinstance(query, str):
+            raise ChatGPTOAuthProtocolError("provider web_search_call event requires a string query")
+        sources = event.get("content") if isinstance(event.get("content"), list) else event.get("sources")
+        if not isinstance(sources, list):
+            raise ChatGPTOAuthProtocolError("provider web_search_call event requires a content/sources array")
+        web_search_requests += 1
+        content.append(
+            {
+                "type": "server_tool_use",
+                "id": call_id,
+                "name": "web_search",
+                "input": {"query": query},
+                "caller": {"type": "direct"},
+            }
+        )
+        content.append(
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": call_id,
+                "content": sources,
+                "caller": {"type": "direct"},
+            }
+        )
+
     if response.content:
         content.append({"type": "text", "text": response.content, "citations": None})
 
@@ -825,6 +1125,11 @@ def internal_response_to_anthropic(
         _anthropic_usage_from_internal(response.usage),
         response.raw,
     )
+    if usage_dict.get("server_tool_use") is None and web_search_requests > 0:
+        usage_dict["server_tool_use"] = {
+            "web_search_requests": web_search_requests,
+            "web_fetch_requests": 0,
+        }
 
     result: dict[str, Any] = {
         "id": request_id,
@@ -1127,6 +1432,7 @@ def _render_anthropic_stream_events(
     block_index = 0
     current_block: str | None = None
     has_tool_calls = False
+    web_search_requests = 0
     pending_thinking_item_id: str | None = None
     pending_thinking_parts: list[str] = []
     saw_pending_thinking_delta = False
@@ -1447,9 +1753,64 @@ def _render_anthropic_stream_events(
             current_block = None
 
         elif typ == "web_search_call":
-            raise ChatGPTOAuthProtocolError(
-                "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
+            _flush_open_unsigned_thinking()
+            if current_block is not None:
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                block_index += 1
+            call_id = event.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                raise ChatGPTOAuthProtocolError("provider web_search_call event requires a non-empty string id")
+            raw_input = event.get("input")
+            query = raw_input.get("query") if isinstance(raw_input, dict) else event.get("query")
+            if not isinstance(query, str):
+                raise ChatGPTOAuthProtocolError("provider web_search_call event requires a string query")
+            sources = event.get("content") if isinstance(event.get("content"), list) else event.get("sources")
+            if not isinstance(sources, list):
+                raise ChatGPTOAuthProtocolError("provider web_search_call event requires a content/sources array")
+            web_search_requests += 1
+            yield _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": call_id,
+                        "name": "web_search",
+                        "input": {},
+                        "caller": {"type": "direct"},
+                    },
+                },
             )
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps({"query": query}, ensure_ascii=False, separators=(",", ":")),
+                    },
+                },
+            )
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            block_index += 1
+            yield _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": call_id,
+                        "content": sources,
+                        "caller": {"type": "direct"},
+                    },
+                },
+            )
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            block_index += 1
+            current_block = None
 
         elif typ == "finish":
             _flush_open_unsigned_thinking()
@@ -1462,6 +1823,11 @@ def _render_anthropic_stream_events(
                 raise ChatGPTOAuthProtocolError("provider finish event finish_reason must be non-empty or null")
             stop_reason = _map_stop_reason(finish_reason, has_tool_calls)
             usage = _anthropic_usage_from_provider(event.get("usage"))
+            if usage.get("server_tool_use") is None and web_search_requests > 0:
+                usage["server_tool_use"] = {
+                    "web_search_requests": web_search_requests,
+                    "web_fetch_requests": 0,
+                }
 
             message_delta: dict[str, Any] = {
                 "type": "message_delta",

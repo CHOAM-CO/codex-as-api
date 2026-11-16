@@ -10,12 +10,16 @@ export {
   resolveCodexCliVersion,
   resolveLatestCodexVersion,
   type ChatOptions,
+  type ResponsesRequestOptions,
+  type ResponsesCompactOptions,
   type ReasoningOptions,
   type PromptCacheOptions,
   type ImageReference,
   type StreamEvent,
   type PreparedModel,
   CHATGPT_OAUTH_DEFAULT_BASE_URL,
+  normalizeNativeResponsesInput,
+  normalizeNativeResponsesTools,
 } from "./provider.js";
 export { createApp, main, type CreateAppOptions } from "./server.js";
 export {

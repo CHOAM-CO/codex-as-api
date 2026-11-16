@@ -1197,7 +1197,7 @@ describe("server error handling", () => {
   it("rejects Anthropic hosted WebSearch on all routes and transport modes before provider work", async () => {
     const previous = process.env.CODEX_AS_API_RESPONSES_LITE;
     try {
-      for (const mode of ["auto", "on", "off"]) {
+      for (const mode of ["auto", "on"]) {
         process.env.CODEX_AS_API_RESPONSES_LITE = mode;
         const provider = new ChatGPTOAuthProvider({ model: "gpt-5.6-sol" });
         await withServer(provider, async (baseUrl) => {
@@ -1217,7 +1217,7 @@ describe("server error handling", () => {
                 max_tokens: 1024,
                 ...(route === "/v1/messages" ? { stream: true } : {}),
                 system: "You are helpful.",
-                tools: [{ type: "web_search_20250305", name: "web_search" }],
+                tools: [{ type: "web_search_20250305", name: "web_search", blocked_domains: ["blocked.example"] }],
                 messages: [{ role: "user", content: "hello" }],
               }),
             });
@@ -1228,7 +1228,7 @@ describe("server error handling", () => {
             assert.equal(body.error.type, "invalid_request_error");
             assert.equal(
               body.error.message,
-              "Anthropic hosted web_search cannot be represented losslessly by this facade",
+              "tool 0 web_search blocked_domains is not supported by the Codex OAuth transport",
             );
           }
         }, { model: "gpt-5.6-sol" });
@@ -4456,10 +4456,14 @@ describe("Anthropic compatibility helper routes", () => {
       const plain = await count({});
       assert.equal(await count({ max_tokens: 1024 }), plain);
       assert.equal(await count({ metadata: { user_id: "user-123" } }), plain);
+      assert.equal(
+        await count({ metadata: { user_id: "user-123", extra: "ok", optional_flag: null } }),
+        plain,
+      );
       assert.equal(await count({ metadata: { user_id: null } }), plain);
       assert.equal(await count({ metadata: {} }), plain);
       for (const badMetadata of [
-        { diagnostic: "x".repeat(4_000) },
+        { extra: 42 },
         { user_id: 123 },
         null,
         [],
@@ -4495,12 +4499,18 @@ describe("Anthropic compatibility helper routes", () => {
         }),
       });
       assert.equal(invalidMaxTokens.status, 400);
+      assert.equal(await count({
+        stop_sequences: ["STOP"],
+        temperature: 0.2,
+        top_p: 0.9,
+        top_k: 40,
+      }), plain);
       const invalidStop = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
-          stop_sequences: ["STOP"],
+          stop_sequences: [123],
           messages: [{ role: "user", content }],
         }),
       });
@@ -4984,29 +4994,26 @@ describe("Anthropic compatibility helper routes", () => {
       assert.equal(res.status, 200);
       assert.deepEqual(await res.json(), { checkpoint: "checkpoint" });
 
-      const unsupported = await fetch(`${baseUrl}/v1/messages/compact`, {
+      const invalidMaxTokens = await fetch(`${baseUrl}/v1/messages/compact`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
+          max_tokens: 0,
           messages: [{ role: "user", content: "hello" }],
-          tool_choice: {
-            type: "auto",
-            disable_parallel_tool_use: false,
-          },
         }),
       });
-      assert.equal(unsupported.status, 400);
+      assert.equal(invalidMaxTokens.status, 400);
       assert.equal(compactCalls, 1);
     });
   });
 
-  it("rejects non-auto Anthropic compact tool choices before provider transport", async () => {
+  it("accepts non-auto Anthropic compact tool choices, sampling hints, and omitted max_tokens", async () => {
     let compactCalls = 0;
     const provider = {
       async compactMessages() {
         compactCalls += 1;
-        throw new Error("provider must not be called");
+        return "checkpoint-ok";
       },
     };
     await withServer(provider, async (baseUrl) => {
@@ -5014,6 +5021,7 @@ describe("Anthropic compatibility helper routes", () => {
         { type: "any" },
         { type: "tool", name: "lookup" },
         { type: "none" },
+        { type: "auto", disable_parallel_tool_use: false },
       ]) {
         const response = await fetch(`${baseUrl}/v1/messages/compact`, {
           method: "POST",
@@ -5023,14 +5031,162 @@ describe("Anthropic compatibility helper routes", () => {
           },
           body: JSON.stringify({
             model: "gpt-5.5",
-            max_tokens: 1024,
+            temperature: 0.3,
+            top_p: 0.8,
+            top_k: 20,
+            stop_sequences: ["DONE"],
             messages: [{ role: "user", content: "hello" }],
             tool_choice: toolChoice,
           }),
         });
-        assert.equal(response.status, 400, await response.clone().text());
+        assert.equal(response.status, 200, await response.clone().text());
       }
-      assert.equal(compactCalls, 0);
+      assert.equal(compactCalls, 4);
+    });
+  });
+
+  it("serves native /v1/responses and /v1/responses/compact and accepts store=false, stream_options, user, and stop=[]", async () => {
+    const provider = {
+      async chat() {
+        return {
+          content: "chat-ok",
+          tool_calls: [],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+          finish_reason: "stop",
+          response_id: "resp_chat_1",
+          raw: { events: [] },
+        };
+      },
+      async *chatStream() {
+        yield { type: "content", text: "stream-ok" };
+        yield {
+          type: "finish",
+          finish_reason: "stop",
+          response_id: "resp_stream_1",
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+        };
+      },
+      async createResponse(opts: { input: unknown; instructions?: string }) {
+        return {
+          id: "resp_native_1",
+          object: "response",
+          status: "completed",
+          model: "gpt-5.5",
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: String(opts.input) }],
+          }],
+          output_text: String(opts.input),
+          usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+        };
+      },
+      async createResponsesStream() {
+        async function* gen() {
+          yield {
+            type: "response.created",
+            response: { id: "resp_native_stream_1", status: "in_progress" },
+          };
+          yield {
+            type: "response.output_text.delta",
+            delta: "native-delta",
+          };
+          yield {
+            type: "response.completed",
+            response: {
+              id: "resp_native_stream_1",
+              object: "response",
+              status: "completed",
+              model: "gpt-5.5",
+              output: [{
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "native-delta" }],
+              }],
+            },
+          };
+        }
+        return gen();
+      },
+      async compactResponses() {
+        return {
+          object: "response.compaction",
+          output: [{
+            type: "compaction",
+            encrypted_content: "enc_compacted",
+          }],
+        };
+      },
+    };
+
+    await withServer(provider, async (baseUrl) => {
+      const chatRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          store: false,
+          user: "user-123",
+          stop: [],
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(chatRes.status, 200);
+
+      const streamNoUsage = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          stream_options: { include_usage: false },
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(streamNoUsage.status, 200);
+      const sseText = await streamNoUsage.text();
+      assert.equal(sseText.includes('"usage"'), false);
+
+      const nativeRes = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: "hello native",
+          instructions: "Be concise.",
+          store: false,
+          user: "user-123",
+        }),
+      });
+      assert.equal(nativeRes.status, 200);
+      const nativeBody = await nativeRes.json() as Record<string, unknown>;
+      assert.equal(nativeBody.id, "resp_native_1");
+      assert.equal(nativeBody.output_text, "hello native");
+
+      const nativeStreamRes = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: "hello stream",
+          stream: true,
+        }),
+      });
+      assert.equal(nativeStreamRes.status, 200);
+      const nativeSse = await nativeStreamRes.text();
+      assert.equal(nativeSse.includes("event: response.completed"), true);
+
+      const compactRes = await fetch(`${baseUrl}/v1/responses/compact`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: [{ type: "message", role: "user", content: "history" }],
+        }),
+      });
+      assert.equal(compactRes.status, 200);
+      const compactBody = await compactRes.json() as Record<string, unknown>;
+      assert.equal(compactBody.object, "response.compaction");
     });
   });
 });
@@ -6493,5 +6649,322 @@ describe("Anthropic /v1/messages encrypted reasoning HTTP round-trip and OpenAI 
       assert.equal(streamText.includes("codex-reasoning-v1:"), false);
       assert.equal(streamText.includes("data: [DONE]"), true);
     });
+  });
+
+  it("emits event:error on /v1/responses mid-stream failures, forwards reasoning.summary, and enforces stream_options stream=true", async () => {
+    const seenResponsesSummary: Array<unknown> = [];
+    const seenCompactSummary: Array<unknown> = [];
+    const mockProvider = {
+      async chat() {
+        return {
+          content: "ok",
+          tool_calls: [],
+          finish_reason: "stop",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          response_id: "resp_c",
+          raw: { events: [] },
+        };
+      },
+      async *chatStream() {
+        yield { type: "content", text: "ok" };
+        yield {
+          type: "finish",
+          finish_reason: "stop",
+          response_id: "resp_cs",
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+      async createResponse(opts: { reasoningSummary?: unknown }) {
+        seenResponsesSummary.push(opts.reasoningSummary);
+        return {
+          id: "resp_summary",
+          object: "response",
+          status: "completed",
+          model: "gpt-5.5",
+          output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+          output_text: "ok",
+        };
+      },
+      async createResponsesStream(opts: { reasoningSummary?: unknown }) {
+        seenResponsesSummary.push(opts.reasoningSummary);
+        async function* gen(): AsyncGenerator<Record<string, unknown>> {
+          yield { type: "response.created", response: { id: "resp_err", status: "in_progress" } };
+          throw new Error("mid-stream boom");
+        }
+        return gen();
+      },
+      async compactResponses(opts: { reasoningSummary?: unknown }) {
+        seenCompactSummary.push(opts.reasoningSummary);
+        return { object: "response.compaction", output: [] };
+      },
+    };
+
+    await withServer(mockProvider, async (baseUrl) => {
+      const midStreamErr = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: "fail mid stream",
+          stream: true,
+        }),
+      });
+      assert.equal(midStreamErr.status, 200);
+      const sseBody = await midStreamErr.text();
+      assert.equal(sseBody.includes("event: error\n"), true);
+      assert.equal(sseBody.includes('"type":"error"'), true);
+      assert.equal(sseBody.includes("data: [DONE]"), false);
+
+      const nullableIncludeUsage = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          stream_options: { include_usage: null },
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(nullableIncludeUsage.status, 200);
+
+      const nonStreamSo = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: false,
+          stream_options: { include_usage: true },
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(nonStreamSo.status, 400);
+
+      const respSummary = await fetch(`${baseUrl}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: "hello",
+          reasoning: { summary: "concise" },
+        }),
+      });
+      assert.equal(respSummary.status, 200);
+
+      const compactSummary = await fetch(`${baseUrl}/v1/responses/compact`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          input: "hello",
+          reasoning: { summary: "detailed" },
+        }),
+      });
+      assert.equal(compactSummary.status, 200);
+      assert.deepEqual(seenResponsesSummary.at(-1), "concise");
+      assert.deepEqual(seenCompactSummary, ["detailed"]);
+
+      const metaMsg = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 64,
+          metadata: { user_id: "u1", trace_tag: "t1", nullable_tag: null },
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+      assert.equal(metaMsg.status, 200);
+    });
+  });
+
+  it("bridges web_search_call open_page and find_in_page across /v1/responses and /v1/messages while keeping /v1/chat/completions unsupported", async () => {
+    const auth = writeAuthFile();
+    const searchItem = {
+      type: "web_search_call",
+      id: "ws_search",
+      status: "completed",
+      action: {
+        type: "search",
+        query: "codex web search",
+        sources: [{ url: "https://example.test/doc", title: "Doc" }],
+      },
+    };
+    const openPageItem = {
+      type: "web_search_call",
+      id: "ws_open",
+      status: "completed",
+      action: { type: "open_page", url: "https://example.test/doc" },
+    };
+    const findItem = {
+      type: "web_search_call",
+      id: "ws_find",
+      status: "completed",
+      action: { type: "find_in_page", pattern: "needle", url: null },
+    };
+    const messageItem = {
+      type: "message",
+      id: "msg_done",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Found it." }],
+    };
+
+    const upstream = createServer((req, res) => {
+      if (
+        req.method === upstreamContract.models_request.method
+        && req.url?.startsWith(`${upstreamContract.models_request.path}?`)
+      ) {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          [upstreamContract.models_request.etag_header]: '"test-catalog"',
+        });
+        res.end(JSON.stringify(TEST_CATALOG_VALUE));
+        return;
+      }
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          [upstreamContract.models_request.responses_etag_header]: '"test-catalog"',
+        });
+        res.write(`data: ${JSON.stringify({
+          type: "response.created",
+          response: { id: "resp_ws_pages", status: "in_progress" },
+        })}\n\n`);
+        for (const item of [searchItem, openPageItem, findItem]) {
+          res.write(`data: ${JSON.stringify({
+            type: "response.output_item.added",
+            item: { type: "web_search_call", status: "in_progress" },
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Found it." })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: "response.output_item.done", item: messageItem })}\n\n`);
+        res.end(`data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_ws_pages",
+            end_turn: true,
+            output: [searchItem, openPageItem, findItem, messageItem],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          },
+        })}\n\n`);
+      });
+    });
+
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = upstream.address();
+      assert.ok(address && typeof address === "object");
+      const provider = new ChatGPTOAuthProvider({
+        model: "gpt-5.5",
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        authJsonPath: auth.authPath,
+      });
+
+      await withServer(provider, async (baseUrl) => {
+        const respRes = await fetch(`${baseUrl}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            input: "Inspect docs",
+            tools: [{ type: "web_search" }],
+          }),
+        });
+        assert.equal(respRes.status, 200);
+        const respJson = await respRes.json() as {
+          output: Array<Record<string, unknown>>;
+        };
+        assert.deepEqual(respJson.output.map((item) => item.id), ["ws_search", "ws_open", "ws_find", "msg_done"]);
+        assert.deepEqual(respJson.output[1].action, { type: "open_page", url: "https://example.test/doc" });
+        assert.deepEqual(respJson.output[2].action, { type: "find_in_page", pattern: "needle", url: null });
+
+        const respStream = await fetch(`${baseUrl}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            input: "Inspect docs",
+            tools: [{ type: "web_search" }],
+            stream: true,
+          }),
+        });
+        assert.equal(respStream.status, 200);
+        const respStreamText = await respStream.text();
+        assert.equal(respStreamText.includes('"type":"open_page"') || respStreamText.includes('"type": "open_page"'), true);
+        assert.equal(respStreamText.includes('"type":"find_in_page"') || respStreamText.includes('"type": "find_in_page"'), true);
+
+        const msgRes = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            max_tokens: 64,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: "user", content: "Inspect docs" }],
+          }),
+        });
+        assert.equal(msgRes.status, 200);
+        const msgJson = await msgRes.json() as {
+          content: Array<Record<string, unknown>>;
+          usage: { server_tool_use: { web_search_requests: number } };
+        };
+        const serverUses = msgJson.content.filter((block) => block.type === "server_tool_use");
+        assert.deepEqual(
+          serverUses.map((block) => (block.input as Record<string, unknown>).query),
+          ["codex web search", "open_page: https://example.test/doc", "find_in_page: needle"],
+        );
+        assert.equal(msgJson.usage.server_tool_use.web_search_requests, 3);
+
+        const replayRes = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            max_tokens: 64,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [
+              { role: "user", content: "Inspect docs" },
+              { role: "assistant", content: msgJson.content },
+              { role: "user", content: "Summarize it." },
+            ],
+          }),
+        });
+        assert.equal(replayRes.status, 200);
+
+        const msgStream = await fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            max_tokens: 64,
+            stream: true,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: "user", content: "Inspect docs" }],
+          }),
+        });
+        assert.equal(msgStream.status, 200);
+        const msgStreamText = await msgStream.text();
+        assert.equal(msgStreamText.includes("open_page: https://example.test/doc"), true);
+        assert.equal(msgStreamText.includes("find_in_page: needle"), true);
+
+        const chatRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-5.5",
+            messages: [{ role: "user", content: "Inspect docs" }],
+          }),
+        });
+        assert.equal(chatRes.status, 502);
+        const chatErr = await chatRes.json() as { error: { type: string } };
+        assert.equal(chatErr.error.type, "upstream_protocol_error");
+      }, { authPath: auth.authPath });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        upstream.close((err) => (err ? reject(err) : resolve()));
+      });
+      fs.rmSync(auth.directory, { recursive: true, force: true });
+    }
   });
 });

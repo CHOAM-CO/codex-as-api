@@ -118,6 +118,7 @@ pub fn anthropic_request_to_internal_for_model(
 
     let stop = match body.get("stop_sequences") {
         None => None,
+        Some(Value::Array(values)) if values.is_empty() => None,
         Some(Value::Array(values)) => {
             let mut result = Vec::with_capacity(values.len());
             for (index, value) in values.iter().enumerate() {
@@ -186,7 +187,20 @@ fn validate_nullable_unrepresentable_field(
     field: &str,
     path: &str,
 ) -> Result<(), String> {
-    if object.get(field).is_some_and(|value| !value.is_null()) {
+    if let Some(value) = object.get(field) {
+        if value.is_null() {
+            return Ok(());
+        }
+        if field == "citations" {
+            if value.as_array().is_some_and(Vec::is_empty) {
+                return Ok(());
+            }
+            if value.as_object().is_some_and(|obj| {
+                obj.len() == 1 && obj.get("enabled") == Some(&Value::Bool(false))
+            }) {
+                return Ok(());
+            }
+        }
         return Err(format!(
             "{path}.{field} cannot be represented by this facade"
         ));
@@ -465,7 +479,19 @@ fn convert_user_message(content: &Value, out: &mut Vec<Message>) -> Result<(), S
                         )?;
                         image_urls.push(anthropic_image_source_url(block.get("source"))?);
                     }
-                    "document" | "search_result" | "server_tool_use" | "web_search_tool_result" => {
+                    "document" => {
+                        text_parts.push(render_document_block(
+                            object,
+                            &format!("messages user content[{block_index}]"),
+                        )?);
+                    }
+                    "search_result" => {
+                        text_parts.push(render_search_result_block(
+                            object,
+                            &format!("messages user content[{block_index}]"),
+                        )?);
+                    }
+                    "server_tool_use" | "web_search_tool_result" => {
                         return Err(format!(
                             "user content block type {block_type:?} cannot be represented losslessly by the Codex OAuth backend"
                         ));
@@ -539,7 +565,17 @@ fn extract_tool_result_content_with_images(
                         &["type", "source", "cache_control"],
                     )?;
                     images.push(anthropic_image_source_url(p.get("source"))?);
-                } else if matches!(typ, "document" | "search_result" | "web_search_tool_result") {
+                } else if typ == "document" {
+                    text_pieces.push(render_document_block(
+                        object,
+                        &format!("tool_result content item {index}"),
+                    )?);
+                } else if typ == "search_result" {
+                    text_pieces.push(render_search_result_block(
+                        object,
+                        &format!("tool_result content item {index}"),
+                    )?);
+                } else if typ == "web_search_tool_result" {
                     return Err(format!(
                         "tool_result content type {typ:?} cannot be represented losslessly by the Codex OAuth backend"
                     ));
@@ -781,11 +817,31 @@ fn convert_assistant_message(
                         }
                         saw_thinking_block = true;
                     }
-                    "server_tool_use"
-                    | "web_search_tool_result"
-                    | "document"
-                    | "search_result"
-                    | "tool_result" => {
+                    "server_tool_use" => {
+                        text_parts.push(render_server_tool_use_block(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                        )?);
+                    }
+                    "web_search_tool_result" => {
+                        text_parts.push(render_web_search_tool_result_block(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                        )?);
+                    }
+                    "document" => {
+                        text_parts.push(render_document_block(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                        )?);
+                    }
+                    "search_result" => {
+                        text_parts.push(render_search_result_block(
+                            object,
+                            &format!("messages assistant content[{block_index}]"),
+                        )?);
+                    }
+                    "tool_result" => {
                         return Err(format!(
                             "assistant content block type {block_type:?} cannot be represented losslessly by the Codex OAuth backend"
                         ));
@@ -832,11 +888,9 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<ToolSchema>, String> {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => return Err(format!("tools[{index}].name must be a non-empty string")),
         };
-        if is_anthropic_web_search_tool(tool) {
-            return Err(
-                "Anthropic hosted web_search cannot be represented losslessly by this facade"
-                    .to_string(),
-            );
+        if let Some(web_search_tool) = convert_anthropic_web_search_tool(object, index)? {
+            result.push(web_search_tool);
+            continue;
         }
         reject_unknown_fields(
             object,
@@ -889,16 +943,10 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<ToolSchema>, String> {
 }
 
 fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {
-    for tool in tools {
+    for (index, tool) in tools.iter().enumerate() {
         let Some(tool) = tool.as_object() else {
             return Err("tools entries must be objects".to_string());
         };
-        if is_anthropic_web_search_tool(&Value::Object(tool.clone())) {
-            return Err(
-                "Anthropic hosted web_search cannot be represented losslessly by this facade"
-                    .to_string(),
-            );
-        }
         for field in ["allowed_callers"] {
             if tool.contains_key(field) {
                 return Err(format!(
@@ -910,11 +958,6 @@ fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {
             return Err(
                 "tool.output_schema is not supported by the Codex OAuth backend".to_string(),
             );
-        }
-        match tool.get("strict") {
-            None | Some(Value::Bool(false)) => {}
-            Some(Value::Bool(true)) => {}
-            Some(_) => return Err("tool.strict must be a boolean when provided".to_string()),
         }
         match tool.get("defer_loading") {
             None | Some(Value::Bool(false)) => {}
@@ -935,22 +978,415 @@ fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {
                 }
             }
         }
+        if convert_anthropic_web_search_tool(tool, index)?.is_some() {
+            continue;
+        }
+        match tool.get("strict") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {}
+            Some(_) => return Err("tool.strict must be a boolean when provided".to_string()),
+        }
     }
     Ok(())
 }
 
-fn is_anthropic_web_search_tool(tool: &Value) -> bool {
-    tool.get("name").and_then(|v| v.as_str()) == Some("web_search")
-        && tool
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                matches!(
-                    s,
-                    "web_search" | "web_search_20250305" | "web_search_20260209"
-                )
-            })
-            .unwrap_or(false)
+fn convert_anthropic_web_search_tool(
+    tool: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<Option<ToolSchema>, String> {
+    let is_web_search = tool.get("name").and_then(Value::as_str) == Some("web_search")
+        && tool.get("type").and_then(Value::as_str).is_some_and(|s| {
+            matches!(
+                s,
+                "web_search" | "web_search_20250305" | "web_search_20260209"
+            )
+        });
+    if !is_web_search {
+        return Ok(None);
+    }
+    reject_unknown_fields(
+        tool,
+        &format!("tools[{index}]"),
+        &[
+            "type",
+            "name",
+            "allowed_domains",
+            "blocked_domains",
+            "max_uses",
+            "strict",
+            "user_location",
+            "cache_control",
+            "defer_loading",
+            "eager_input_streaming",
+            "allowed_callers",
+            "output_schema",
+        ],
+    )?;
+    match tool.get("strict") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(format!(
+                "tools[{index}] web_search strict mode is not supported by the Codex OAuth backend"
+            ));
+        }
+        Some(_) => return Err("tool.strict must be a boolean when provided".to_string()),
+    }
+    if tool
+        .get("blocked_domains")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(format!(
+            "tools[{index}] web_search blocked_domains is not supported by the Codex OAuth backend"
+        ));
+    }
+    if let Some(max_uses) = tool.get("max_uses").filter(|value| !value.is_null()) {
+        if !max_uses
+            .as_i64()
+            .is_some_and(|value| value > 0 && value <= 9_007_199_254_740_991)
+        {
+            return Err(format!(
+                "tools[{index}].max_uses must be a positive integer"
+            ));
+        }
+    }
+    let mut openai_tool =
+        serde_json::Map::from_iter([("type".to_string(), Value::String("web_search".to_string()))]);
+    if let Some(allowed_domains) = tool.get("allowed_domains").filter(|v| !v.is_null()) {
+        let domains = allowed_domains.as_array().ok_or_else(|| {
+            format!("tools[{index}].allowed_domains must be a non-empty array of strings")
+        })?;
+        if domains.is_empty() {
+            return Err(format!(
+                "tools[{index}].allowed_domains must be a non-empty array of strings"
+            ));
+        }
+        let mut normalized_domains = Vec::with_capacity(domains.len());
+        for domain in domains {
+            let domain = domain
+                .as_str()
+                .filter(|d| !d.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("tools[{index}].allowed_domains must be a non-empty array of strings")
+                })?;
+            normalized_domains.push(Value::String(domain.to_string()));
+        }
+        openai_tool.insert(
+            "filters".to_string(),
+            json!({ "allowed_domains": normalized_domains }),
+        );
+    }
+    if let Some(user_location) = tool.get("user_location").filter(|v| !v.is_null()) {
+        let loc_obj = user_location
+            .as_object()
+            .ok_or_else(|| format!("tools[{index}].user_location must be an object"))?;
+        reject_unknown_fields(
+            loc_obj,
+            &format!("tools[{index}].user_location"),
+            &["type", "city", "country", "region", "timezone"],
+        )?;
+        if loc_obj.get("type").and_then(Value::as_str) != Some("approximate") {
+            return Err(format!(
+                "tools[{index}].user_location.type must be approximate"
+            ));
+        }
+        let mut normalized_loc = serde_json::Map::from_iter([(
+            "type".to_string(),
+            Value::String("approximate".to_string()),
+        )]);
+        for field in ["city", "country", "region", "timezone"] {
+            if let Some(val) = loc_obj.get(field).filter(|v| !v.is_null()) {
+                let s = val
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!("tools[{index}].user_location.{field} must be a non-empty string")
+                    })?;
+                if field == "country"
+                    && (s.len() != 2 || !s.chars().all(|c| c.is_ascii_alphabetic()))
+                {
+                    return Err(format!(
+                        "tools[{index}].user_location.country must be a two-letter ISO country code"
+                    ));
+                }
+                normalized_loc.insert(field.to_string(), Value::String(s.to_string()));
+            }
+        }
+        openai_tool.insert("user_location".to_string(), Value::Object(normalized_loc));
+    }
+    Ok(Some(ToolSchema {
+        name: "web_search".to_string(),
+        description: None,
+        parameters: json!({
+            "__codex_as_api_tool_type": "web_search",
+            "openai_tool": Value::Object(openai_tool),
+        }),
+        strict: false,
+    }))
+}
+
+fn render_document_block(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<String, String> {
+    validate_nullable_unrepresentable_field(object, "citations", path)?;
+    reject_unknown_fields(
+        object,
+        path,
+        &[
+            "type",
+            "source",
+            "title",
+            "context",
+            "cache_control",
+            "citations",
+        ],
+    )?;
+    let title = match object.get("title") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
+        Some(_) => return Err(format!("{path}.title must be a non-empty string")),
+    };
+    let context = match object.get("context") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
+        Some(_) => return Err(format!("{path}.context must be a non-empty string")),
+    };
+    let source = object
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{path}.source must be an object"))?;
+    let body = match source.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            reject_unknown_fields(
+                source,
+                &format!("{path}.source"),
+                &["type", "media_type", "data"],
+            )?;
+            if let Some(media_type) = source.get("media_type").filter(|v| !v.is_null()) {
+                if media_type.as_str() != Some("text/plain") {
+                    return Err(format!(
+                        "{path}.source.media_type must be text/plain for text document blocks"
+                    ));
+                }
+            }
+            source
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{path}.source.data must be a string"))?
+                .to_string()
+        }
+        Some("content") => {
+            reject_unknown_fields(source, &format!("{path}.source"), &["type", "content"])?;
+            match source.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(items)) if !items.is_empty() => {
+                    let mut parts = Vec::with_capacity(items.len());
+                    for (idx, item) in items.iter().enumerate() {
+                        let item_obj = item.as_object().ok_or_else(|| {
+                            format!("{path}.source.content[{idx}] must be an object")
+                        })?;
+                        if item_obj.get("type").and_then(Value::as_str) != Some("text") {
+                            return Err(format!(
+                                "{path}.source.content[{idx}] must be a text block"
+                            ));
+                        }
+                        validate_nullable_unrepresentable_field(
+                            item_obj,
+                            "citations",
+                            &format!("{path}.source.content[{idx}]"),
+                        )?;
+                        reject_unknown_fields(
+                            item_obj,
+                            &format!("{path}.source.content[{idx}]"),
+                            &["type", "text", "cache_control", "citations"],
+                        )?;
+                        let text =
+                            item_obj
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    format!("{path}.source.content[{idx}] requires string text")
+                                })?;
+                        parts.push(text.to_string());
+                    }
+                    parts.join("")
+                }
+                _ => {
+                    return Err(format!(
+                        "{path}.source.content must be a string or non-empty array"
+                    ))
+                }
+            }
+        }
+        _ => {
+            return Err(format!(
+                "{path}.source.type is not supported by this facade"
+            ))
+        }
+    };
+    let mut header = "[document".to_string();
+    if let Some(title) = title {
+        header.push_str(&format!(
+            " title={}",
+            serde_json::to_string(title).unwrap_or_default()
+        ));
+    }
+    if let Some(context) = context {
+        header.push_str(&format!(
+            " context={}",
+            serde_json::to_string(context).unwrap_or_default()
+        ));
+    }
+    header.push(']');
+    Ok(format!("{header}\n{body}\n[/document]"))
+}
+
+fn render_search_result_block(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<String, String> {
+    validate_nullable_unrepresentable_field(object, "citations", path)?;
+    reject_unknown_fields(
+        object,
+        path,
+        &[
+            "type",
+            "source",
+            "url",
+            "title",
+            "content",
+            "cache_control",
+            "citations",
+        ],
+    )?;
+    let source = object
+        .get("source")
+        .or_else(|| object.get("url"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{path}.source must be a non-empty string"))?;
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{path}.title must be a non-empty string"))?;
+    let body = match object.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) if !items.is_empty() => {
+            let mut parts = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let item_obj = item
+                    .as_object()
+                    .ok_or_else(|| format!("{path}.content[{idx}] must be an object"))?;
+                if item_obj.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err(format!("{path}.content[{idx}] must be a text block"));
+                }
+                validate_nullable_unrepresentable_field(
+                    item_obj,
+                    "citations",
+                    &format!("{path}.content[{idx}]"),
+                )?;
+                reject_unknown_fields(
+                    item_obj,
+                    &format!("{path}.content[{idx}]"),
+                    &["type", "text", "cache_control", "citations"],
+                )?;
+                let text = item_obj
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{path}.content[{idx}] requires string text"))?;
+                parts.push(text.to_string());
+            }
+            parts.join("")
+        }
+        _ => {
+            return Err(format!(
+                "{path}.content must be a string or non-empty array"
+            ))
+        }
+    };
+    Ok(format!(
+        "[search_result source={} title={}]\n{body}\n[/search_result]",
+        serde_json::to_string(source).unwrap_or_default(),
+        serde_json::to_string(title).unwrap_or_default()
+    ))
+}
+
+fn render_server_tool_use_block(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<String, String> {
+    reject_unknown_fields(
+        object,
+        path,
+        &["type", "id", "name", "input", "cache_control", "caller"],
+    )?;
+    if let Some(caller) = object.get("caller") {
+        let caller = caller
+            .as_object()
+            .ok_or_else(|| format!("{path}.caller must be an object"))?;
+        reject_unknown_fields(caller, &format!("{path}.caller"), &["type"])?;
+        if caller.get("type").and_then(Value::as_str) != Some("direct") {
+            return Err(format!("{path}.caller.type must be direct"));
+        }
+    }
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{path}.id must be a non-empty string"))?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{path}.name must be a non-empty string"))?;
+    if name != "web_search" {
+        return Err(format!("{path}.name must be web_search"));
+    }
+    let input = object
+        .get("input")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{path}.input must be an object"))?;
+    Ok(format!(
+        "[server_tool_use id={} name={} input={}]",
+        serde_json::to_string(id).unwrap_or_default(),
+        serde_json::to_string(name).unwrap_or_default(),
+        serde_json::to_string(input).unwrap_or_default()
+    ))
+}
+
+fn render_web_search_tool_result_block(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<String, String> {
+    reject_unknown_fields(
+        object,
+        path,
+        &["type", "tool_use_id", "content", "cache_control", "caller"],
+    )?;
+    if let Some(caller) = object.get("caller") {
+        let caller = caller
+            .as_object()
+            .ok_or_else(|| format!("{path}.caller must be an object"))?;
+        reject_unknown_fields(caller, &format!("{path}.caller"), &["type"])?;
+        if caller.get("type").and_then(Value::as_str) != Some("direct") {
+            return Err(format!("{path}.caller.type must be direct"));
+        }
+    }
+    let tool_use_id = object
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{path}.tool_use_id must be a non-empty string"))?;
+    let content = object
+        .get("content")
+        .filter(|v| v.is_array() || v.is_object())
+        .ok_or_else(|| format!("{path}.content must be an array or object"))?;
+    Ok(format!(
+        "[web_search_tool_result tool_use_id={}]\n{}\n[/web_search_tool_result]",
+        serde_json::to_string(tool_use_id).unwrap_or_default(),
+        serde_json::to_string(content).unwrap_or_default()
+    ))
 }
 
 fn convert_tool_choice(tc: &Value) -> Result<(Value, Option<bool>), String> {
@@ -986,10 +1422,7 @@ fn convert_tool_choice(tc: &Value) -> Result<(Value, Option<bool>), String> {
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| "tool_choice.name must be a non-empty string".to_string())?;
             if name == "web_search" {
-                return Err(
-                    "Anthropic hosted web_search cannot be represented losslessly by this facade"
-                        .to_string(),
-                );
+                json!({"type": "web_search"})
             } else {
                 json!({"type": "function", "name": name})
             }
@@ -1335,7 +1768,8 @@ pub fn internal_response_to_anthropic_with_options(
 ) -> Result<Value, String> {
     let mut content: Vec<Value> = Vec::new();
 
-    reject_unrepresentable_response_events(response.raw.as_ref())?;
+    let web_search_blocks = extract_web_search_blocks_from_raw(response.raw.as_ref())?;
+    let web_search_requests = (web_search_blocks.len() / 2) as u64;
 
     let mut joined_visible_reasoning = String::new();
     if !disabled {
@@ -1397,6 +1831,8 @@ pub fn internal_response_to_anthropic_with_options(
     } else {
         None
     };
+
+    content.extend(web_search_blocks);
 
     if !response.content.is_empty() {
         content.push(json!({"type": "text", "text": response.content, "citations": null}));
@@ -1460,7 +1896,19 @@ pub fn internal_response_to_anthropic_with_options(
         "service_tier": null,
         "speed": null,
     });
-    let usage_dict = merge_actual_usage_extensions(usage_dict, response.raw.as_ref())?;
+    let mut usage_dict = merge_actual_usage_extensions(usage_dict, response.raw.as_ref())?;
+    if web_search_requests > 0 && usage_dict.get("server_tool_use").is_none_or(Value::is_null) {
+        usage_dict
+            .as_object_mut()
+            .expect("Anthropic usage literal must be an object")
+            .insert(
+                "server_tool_use".to_string(),
+                json!({
+                    "web_search_requests": web_search_requests,
+                    "web_fetch_requests": 0,
+                }),
+            );
+    }
     object.insert("usage".to_string(), usage_dict);
     Ok(result)
 }
@@ -1478,14 +1926,15 @@ fn raw_reasoning_item_model(raw: Option<&Value>) -> Option<&str> {
     })
 }
 
-fn reject_unrepresentable_response_events(raw: Option<&Value>) -> Result<(), String> {
+fn extract_web_search_blocks_from_raw(raw: Option<&Value>) -> Result<Vec<Value>, String> {
     let Some(raw) = raw else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let events = raw
         .get("events")
         .and_then(Value::as_array)
         .ok_or_else(|| "normalized response raw.events must be an array".to_string())?;
+    let mut blocks = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let event_type = event
             .get("type")
@@ -1499,12 +1948,89 @@ fn reject_unrepresentable_response_events(raw: Option<&Value>) -> Result<(), Str
         if event_type != "web_search_call" {
             continue;
         }
-        return Err(
-            "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
-                .to_string(),
-        );
+        let (call_id, query, results) = parse_web_search_call_event(event)?;
+        blocks.push(json!({
+            "type": "server_tool_use",
+            "id": call_id,
+            "name": "web_search",
+            "input": { "query": query },
+            "caller": { "type": "direct" },
+        }));
+        blocks.push(json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": call_id,
+            "content": results,
+            "caller": { "type": "direct" },
+        }));
     }
-    Ok(())
+    Ok(blocks)
+}
+
+fn parse_web_search_call_event(event: &Value) -> Result<(String, String, Vec<Value>), String> {
+    let call_id = event
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "web_search_call event requires a non-empty string id".to_string())?
+        .to_string();
+    let query = event
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .get("input")
+                .and_then(Value::as_object)
+                .and_then(|input| input.get("query"))
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| "web_search_call event requires a string query".to_string())?
+        .to_string();
+    let raw_results = event
+        .get("content")
+        .and_then(Value::as_array)
+        .or_else(|| event.get("sources").and_then(Value::as_array))
+        .ok_or_else(|| "web_search_call event requires a content/sources array".to_string())?;
+    let mut results = Vec::with_capacity(raw_results.len());
+    for (idx, item) in raw_results.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("web_search_call result {idx} must be an object"))?;
+        let url = obj
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| format!("web_search_call result {idx} requires a non-empty url"))?;
+        let mut entry = serde_json::Map::from_iter([
+            (
+                "type".to_string(),
+                Value::String("web_search_result".to_string()),
+            ),
+            ("url".to_string(), Value::String(url.to_string())),
+        ]);
+        if let Some(title) = obj.get("title").filter(|v| !v.is_null()) {
+            let title = title
+                .as_str()
+                .ok_or_else(|| format!("web_search_call result {idx} title must be a string"))?;
+            entry.insert("title".to_string(), Value::String(title.to_string()));
+        }
+        if let Some(enc) = obj.get("encrypted_content").filter(|v| !v.is_null()) {
+            let enc = enc.as_str().ok_or_else(|| {
+                format!("web_search_call result {idx} encrypted_content must be a string")
+            })?;
+            entry.insert(
+                "encrypted_content".to_string(),
+                Value::String(enc.to_string()),
+            );
+        }
+        if let Some(page_age) = obj.get("page_age").filter(|v| !v.is_null()) {
+            let page_age = page_age
+                .as_str()
+                .ok_or_else(|| format!("web_search_call result {idx} page_age must be a string"))?;
+            entry.insert("page_age".to_string(), Value::String(page_age.to_string()));
+        }
+        results.push(Value::Object(entry));
+    }
+    Ok((call_id, query, results))
 }
 
 fn merge_actual_usage_extensions(mut usage: Value, raw: Option<&Value>) -> Result<Value, String> {
@@ -1596,6 +2122,7 @@ pub struct AnthropicStreamAdapter {
     current_block: Option<&'static str>,
     active_thinking_item_id: Option<String>,
     has_tool_calls: bool,
+    web_search_requests: u64,
     finished: bool,
 }
 
@@ -1632,6 +2159,7 @@ impl AnthropicStreamAdapter {
             current_block: None,
             active_thinking_item_id: None,
             has_tool_calls: false,
+            web_search_requests: 0,
             finished: false,
         }
     }
@@ -1914,10 +2442,69 @@ impl AnthropicStreamAdapter {
             }
 
             "web_search_call" => {
-                return Err(
-                    "provider web_search_call output cannot be represented losslessly by the Anthropic facade"
-                        .to_string(),
-                );
+                if let Some(active_id) = self.active_thinking_item_id.as_deref() {
+                    return Err(format!(
+                        "thinking block with item_id {active_id} ended without a matching reasoning_item event"
+                    ));
+                }
+                if current_block.is_some() {
+                    out.push(sse(
+                        "content_block_stop",
+                        &json!({"type": "content_block_stop", "index": block_index}),
+                    ));
+                    block_index += 1;
+                    current_block = None;
+                }
+                let (call_id, query, results) = parse_web_search_call_event(event)?;
+                self.web_search_requests += 1;
+                out.push(sse(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "server_tool_use",
+                            "id": call_id,
+                            "name": "web_search",
+                            "input": {},
+                            "caller": {"type": "direct"},
+                        },
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": serde_json::to_string(&json!({"query": query})).unwrap_or_default(),
+                        },
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block_index}),
+                ));
+                block_index += 1;
+                out.push(sse(
+                    "content_block_start",
+                    &json!({
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": call_id,
+                            "content": results,
+                            "caller": {"type": "direct"},
+                        },
+                    }),
+                ));
+                out.push(sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block_index}),
+                ));
+                block_index += 1;
             }
 
             "finish" => {
@@ -1948,7 +2535,21 @@ impl AnthropicStreamAdapter {
                     .get("usage")
                     .filter(|usage| !usage.is_null())
                     .ok_or_else(|| "finish event requires authoritative usage".to_string())?;
-                let usage = anthropic_usage_from_provider(usage_value)?;
+                let mut usage = anthropic_usage_from_provider(usage_value)?;
+                if self.web_search_requests > 0
+                    && usage.get("server_tool_use").is_none_or(Value::is_null)
+                {
+                    usage
+                        .as_object_mut()
+                        .expect("Anthropic usage literal must be an object")
+                        .insert(
+                            "server_tool_use".to_string(),
+                            json!({
+                                "web_search_requests": self.web_search_requests,
+                                "web_fetch_requests": 0,
+                            }),
+                        );
+                }
                 let message_delta = json!({
                     "type": "message_delta",
                     "context_management": null,
@@ -2928,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_lossy_assistant_server_web_search_history() {
+    fn test_accepts_assistant_server_web_search_history() {
         let body = json!({
             "messages": [{"role": "assistant", "content": [
                 {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "codex"}},
@@ -2938,11 +3539,16 @@ mod tests {
                 {"type": "text", "text": "Summary"},
             ]}],
         });
-        assert!(anthropic_request_to_internal(&body).is_err());
+        let (messages, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("server_tool_use"));
+        assert!(messages[0].content.contains("srv_1"));
+        assert!(messages[0].content.contains("https://example.com"));
+        assert!(messages[0].content.contains("Summary"));
     }
 
     #[test]
-    fn test_rejects_lossy_non_text_tool_result_blocks() {
+    fn test_accepts_non_text_tool_result_blocks() {
         let body = json!({
             "messages": [{"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "call-1", "content": [
@@ -2951,7 +3557,10 @@ mod tests {
                 ]},
             ]}],
         });
-        assert!(anthropic_request_to_internal(&body).is_err());
+        let (messages, _, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("Docs"));
+        assert!(messages[0].content.contains("document body"));
     }
 
     #[test]
@@ -3116,11 +3725,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_choice_web_search_is_rejected() {
+    fn test_tool_choice_web_search_is_accepted() {
         let body = json!({"messages": [], "tool_choice": {"type": "tool", "name": "web_search"}});
-        assert!(anthropic_request_to_internal(&body)
-            .unwrap_err()
-            .contains("cannot be represented losslessly"));
+        let (_, _, tc, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        assert_eq!(tc, Some(json!({"type": "web_search"})));
     }
 
     #[test]
@@ -3138,9 +3746,70 @@ mod tests {
     }
 
     #[test]
-    fn test_hosted_web_search_tools_are_rejected() {
+    fn test_hosted_web_search_tools_are_accepted() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"type": "web_search", "name": "web_search"}],
+        });
+        let (_, tools, _, _, _, _) = anthropic_request_to_internal(&body).unwrap();
+        let tools = tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "web_search");
+        assert_eq!(
+            tools[0].parameters,
+            json!({
+                "__codex_as_api_tool_type": "web_search",
+                "openai_tool": {"type": "web_search"}
+            })
+        );
+
+        let body_with_location = json!({
+            "messages": [],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "strict": false,
+                "user_location": {"type": "approximate", "country": "US"}
+            }],
+        });
+        let (_, tools_loc, _, _, _, _) =
+            anthropic_request_to_internal(&body_with_location).unwrap();
+        let tools_loc = tools_loc.unwrap();
+        assert_eq!(
+            tools_loc[0].parameters,
+            json!({
+                "__codex_as_api_tool_type": "web_search",
+                "openai_tool": {
+                    "type": "web_search",
+                    "user_location": {"type": "approximate", "country": "US"}
+                }
+            })
+        );
+
+        let body_with_filters = json!({
+            "messages": [],
+            "tools": [{
+                "type": "web_search_20260209",
+                "name": "web_search",
+                "allowed_domains": ["example.com"],
+                "max_uses": 8,
+            }],
+        });
+        let (_, tools_filters, _, _, _, _) =
+            anthropic_request_to_internal(&body_with_filters).unwrap();
+        let tools_filters = tools_filters.unwrap();
+        assert_eq!(
+            tools_filters[0].parameters,
+            json!({
+                "__codex_as_api_tool_type": "web_search",
+                "openai_tool": {
+                    "type": "web_search",
+                    "filters": {"allowed_domains": ["example.com"]}
+                }
+            })
+        );
+
         for tool in [
-            json!({"type": "web_search", "name": "web_search"}),
             json!({
                 "type": "web_search_20250305",
                 "name": "web_search",
@@ -3149,10 +3818,7 @@ mod tests {
             json!({
                 "type": "web_search_20260209",
                 "name": "web_search",
-                "allowed_domains": ["example.com"],
-                "max_uses": 8,
-                "strict": false,
-                "user_location": {"type": "approximate", "country": "US"}
+                "strict": true
             }),
         ] {
             let body = json!({
@@ -3161,7 +3827,7 @@ mod tests {
             });
             assert!(anthropic_request_to_internal(&body)
                 .unwrap_err()
-                .contains("cannot be represented losslessly"));
+                .contains("is not supported by the Codex OAuth backend"));
         }
 
         // Unknown versioned declarations still fail as invalid custom tool types.
@@ -3826,12 +4492,25 @@ mod tests {
     }
 
     #[test]
-    fn test_response_web_search_output_is_rejected() {
+    fn test_response_web_search_output_is_converted() {
         let mut resp = make_response("answer", vec![], "stop", None, None);
-        resp.raw = Some(json!({"events": [{"type": "web_search_call"}]}));
-        assert!(internal_response_to_anthropic(&resp, "claude-3", "msg_web")
-            .unwrap_err()
-            .contains("cannot be represented losslessly"));
+        resp.raw = Some(json!({
+            "events": [{
+                "type": "web_search_call",
+                "id": "ws_1",
+                "input": {"query": "codex"},
+                "content": [{"type": "web_search_result", "title": "Codex", "url": "https://example.com"}]
+            }]
+        }));
+        let out = internal_response_to_anthropic(&resp, "claude-3", "msg_web").unwrap();
+        assert_eq!(out["content"][0]["type"], "server_tool_use");
+        assert_eq!(out["content"][0]["id"], "ws_1");
+        assert_eq!(out["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(out["content"][1]["tool_use_id"], "ws_1");
+        assert_eq!(
+            out["usage"]["server_tool_use"],
+            json!({"web_search_requests": 1, "web_fetch_requests": 0})
+        );
     }
 
     #[test]
@@ -4222,7 +4901,7 @@ mod tests {
         assert!(adapter
             .push(&json!({"type": "web_search_call"}))
             .unwrap_err()
-            .contains("cannot be represented losslessly"));
+            .contains("non-empty string id"));
     }
 
     // -----------------------------------------------------------------------

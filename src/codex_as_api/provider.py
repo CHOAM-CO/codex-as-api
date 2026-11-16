@@ -16,7 +16,7 @@ import urllib.request
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, NoReturn, cast
 
 from . import __version__
@@ -72,7 +72,11 @@ from .protocol import (
     reasoning_parts_from_response_items,
     response_failure_message,
 )
-from .reasoning_signature import extract_reasoning_item_for_model
+from .reasoning_signature import (
+    extract_reasoning_item_for_model,
+    is_reasoning_model_compatible,
+    validate_replayable_reasoning_item,
+)
 from .strict_json import strict_json_loads
 
 CHATGPT_OAUTH_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -247,6 +251,7 @@ class PreparedChatRequest:
     replay_input: tuple[dict[str, Any], ...]
     snapshot: ModelCatalogSnapshot
     capability: ModelCapability
+    extra_headers: dict[str, str] = field(default_factory=dict)
 
 
 class _TransportHeaders(dict[str, str]):
@@ -1340,6 +1345,403 @@ class ChatGPTOAuthProvider:
             )
         )
 
+    def create_responses_stream(
+        self,
+        *,
+        model: str | None = None,
+        input: object = None,
+        instructions: str | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_mode: str | None = None,
+        reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
+        prompt_cache_key: str | None = None,
+        subagent: str | None = None,
+        memgen_request: bool | None = None,
+        previous_response_id: str | None = None,
+        service_tier: str | None = None,
+        text: dict[str, Any] | None = None,
+        client_metadata: dict[str, str] | None = None,
+        codex_metadata: bool | None = None,
+        responses_lite: bool | str | None = None,
+        safety_identifier: str | None = None,
+        prompt_cache_options: dict[str, Any] | None = None,
+        verbosity: str | None = None,
+        include: Sequence[str] | None = None,
+        _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        prepared = self._native_responses_payload(
+            model=model,
+            input=input,
+            instructions=instructions,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
+            prompt_cache_key=prompt_cache_key,
+            subagent=subagent,
+            memgen_request=memgen_request,
+            previous_response_id=previous_response_id,
+            service_tier=service_tier,
+            text=text,
+            client_metadata=client_metadata,
+            codex_metadata=codex_metadata,
+            responses_lite=responses_lite,
+            safety_identifier=safety_identifier,
+            prompt_cache_options=prompt_cache_options,
+            verbosity=verbosity,
+            include=include,
+            _resolved_model=_resolved_model,
+        )
+        yield from self._stream_responses_payload(prepared)
+
+    def create_response(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        prepared = self._native_responses_payload(**kwargs)
+        output_items: list[dict[str, Any]] = []
+        completed_response: dict[str, Any] | None = None
+        for event in self._stream_responses_payload(prepared):
+            if event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
+                output_items.append(deepcopy(event["item"]))
+            elif event.get("type") == "response.completed" and isinstance(event.get("response"), dict):
+                completed_response = dict(event["response"])
+        if completed_response is None:
+            raise ChatGPTOAuthProtocolError("ChatGPT OAuth response stream ended before response.completed")
+        if not isinstance(completed_response.get("output"), list) or not completed_response["output"]:
+            completed_response["output"] = output_items
+        if not isinstance(completed_response.get("object"), str):
+            completed_response["object"] = "response"
+        if not isinstance(completed_response.get("model"), str):
+            completed_response["model"] = prepared.payload["model"]
+        if not isinstance(completed_response.get("output_text"), str):
+            completed_response["output_text"] = _text_from_response_items(
+                completed_response["output"]
+            )
+        return completed_response
+
+    def compact_responses(
+        self,
+        *,
+        model: str | None = None,
+        input: object = None,
+        instructions: str | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        parallel_tool_calls: bool | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_mode: str | None = None,
+        reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
+        responses_lite: bool | str | None = None,
+        previous_response_id: str | None = None,
+        prompt_cache_key: str | None = None,
+        prompt_cache_options: dict[str, Any] | None = None,
+        service_tier: str | None = None,
+        text: dict[str, Any] | None = None,
+        verbosity: str | None = None,
+        _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
+    ) -> dict[str, Any]:
+        snapshot, capability = _resolved_model or self.resolve_model(model)
+        request_model = capability.slug
+        input_items = normalize_native_responses_input(
+            input,
+            target_model=request_model,
+            allow_empty=previous_response_id is not None,
+        )
+        if previous_response_id is not None:
+            validated_previous_response_id = _validate_previous_response_id(previous_response_id)
+            input_items = (
+                self._response_chains.resolve(
+                    validated_previous_response_id,
+                    account_id=snapshot.account_id,
+                    current_comp_hash=capability.comp_hash,
+                )
+                + input_items
+            )
+        tools_payload = normalize_native_responses_tools(tools)
+        if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+            raise ChatGPTOAuthInvalidRequestError("parallel_tool_calls must be a boolean")
+        payload: dict[str, Any] = {
+            "model": request_model,
+            "input": input_items,
+            "tools": tools_payload,
+            "parallel_tool_calls": parallel_tool_calls is True,
+        }
+        if instructions is not None:
+            if not isinstance(instructions, str):
+                raise ChatGPTOAuthInvalidRequestError("instructions must be a string when provided")
+            if instructions:
+                payload["instructions"] = instructions
+        if prompt_cache_key is not None:
+            payload["prompt_cache_key"] = _validate_non_empty_string(
+                prompt_cache_key,
+                "prompt_cache_key",
+            )
+        _finalize_responses_payload(
+            payload,
+            capability=capability,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
+            service_tier=service_tier,
+            text=text,
+            verbosity=verbosity,
+            responses_lite=responses_lite,
+            include_encrypted_content=False,
+            prompt_cache_options=prompt_cache_options,
+        )
+        data = self._post_json(
+            "/responses/compact",
+            payload,
+            extra_headers=_responses_transport_headers(
+                payload,
+                catalog_key=snapshot.key,
+            ),
+            catalog_key=snapshot.key,
+        )
+        output = data.get("output")
+        if not isinstance(output, list):
+            raise ChatGPTOAuthProtocolError("remote compact response missing output array")
+        compacted_output: list[dict[str, Any]] = []
+        for index, item in enumerate(output):
+            if not isinstance(item, dict):
+                raise ChatGPTOAuthProtocolError(f"remote compact output item {index} must be an object")
+            _validate_compacted_history_item(item, index=index, source="output")
+            compacted_output.append(item)
+        return {
+            "object": "response.compaction",
+            **data,
+            "output": compacted_output,
+        }
+
+    def _stream_responses_payload(
+        self,
+        prepared: PreparedChatRequest,
+    ) -> Iterator[dict[str, Any]]:
+        payload = prepared.payload
+        replay_input = prepared.replay_input
+        final_output: list[dict[str, Any]] = []
+        for event in self._post_sse(
+            "/responses",
+            payload,
+            extra_headers=_responses_transport_headers(
+                payload,
+                catalog_key=prepared.snapshot.key,
+                extra_headers=prepared.extra_headers,
+            ),
+            catalog_key=prepared.snapshot.key,
+        ):
+            _validate_response_event(event)
+            typ = event.get("type")
+            if typ == "response.output_item.done":
+                item = event.get("item")
+                if not isinstance(item, dict):
+                    raise ChatGPTOAuthProtocolError("response.output_item.done must contain an object item")
+                final_output.append(deepcopy(item))
+            elif typ == "response.failed":
+                raise ChatGPTOAuthUpstreamError(
+                    502,
+                    response_failure_message(event, "failed"),
+                )
+            elif typ == "response.incomplete":
+                raise ChatGPTOAuthUpstreamError(
+                    502,
+                    response_failure_message(event, "incomplete"),
+                )
+            elif typ == "response.completed":
+                response = _validated_completed_response(event)
+                raw_output = response.get("output")
+                completed_output = (
+                    deepcopy(raw_output)
+                    if isinstance(raw_output, list) and len(raw_output) > 0
+                    else deepcopy(final_output)
+                )
+                chain_output = final_output if final_output else completed_output
+                self._response_chains.commit(
+                    response["id"],
+                    replay_input,
+                    chain_output,
+                    account_id=prepared.snapshot.account_id,
+                    comp_hash=prepared.capability.comp_hash,
+                )
+                completed_response = dict(response)
+                if not isinstance(completed_response.get("object"), str):
+                    completed_response["object"] = "response"
+                if not isinstance(completed_response.get("status"), str):
+                    completed_response["status"] = "completed"
+                if not isinstance(completed_response.get("model"), str):
+                    completed_response["model"] = prepared.capability.slug
+                completed_response["output"] = completed_output
+                yield {
+                    **event,
+                    "response": completed_response,
+                }
+                return
+            yield event
+        raise ChatGPTOAuthProtocolError("ChatGPT OAuth response stream ended before response.completed")
+
+    def _native_responses_payload(
+        self,
+        *,
+        model: str | None = None,
+        input: object = None,
+        instructions: str | None = None,
+        tools: Sequence[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_mode: str | None = None,
+        reasoning_context: str | None = None,
+        reasoning_summary: str | None = None,
+        allow_disabled_fallback: bool = False,
+        prompt_cache_key: str | None = None,
+        subagent: str | None = None,
+        memgen_request: bool | None = None,
+        previous_response_id: str | None = None,
+        service_tier: str | None = None,
+        text: dict[str, Any] | None = None,
+        client_metadata: dict[str, str] | None = None,
+        codex_metadata: bool | None = None,
+        responses_lite: bool | str | None = None,
+        safety_identifier: str | None = None,
+        prompt_cache_options: dict[str, Any] | None = None,
+        verbosity: str | None = None,
+        include: Sequence[str] | None = None,
+        _resolved_model: tuple[ModelCatalogSnapshot, ModelCapability] | None = None,
+    ) -> PreparedChatRequest:
+        snapshot, capability = _resolved_model or self.resolve_model(model)
+        request_model = capability.slug
+        input_items = normalize_native_responses_input(
+            input,
+            target_model=request_model,
+            allow_empty=previous_response_id is not None,
+        )
+        if previous_response_id is not None:
+            validated_previous_response_id = _validate_previous_response_id(previous_response_id)
+            input_items = (
+                self._response_chains.resolve(
+                    validated_previous_response_id,
+                    account_id=snapshot.account_id,
+                    current_comp_hash=capability.comp_hash,
+                )
+                + input_items
+            )
+        tools_payload = normalize_native_responses_tools(tools)
+        if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+            raise ChatGPTOAuthInvalidRequestError("parallel_tool_calls must be a boolean")
+        include_list: list[str] = []
+        if include is not None:
+            for item in include:
+                if not isinstance(item, str) or not item.strip():
+                    raise ChatGPTOAuthInvalidRequestError("include must contain only non-empty strings")
+                if item not in include_list:
+                    include_list.append(item)
+        if (
+            any(tool.get("type") == "web_search" for tool in tools_payload)
+            and "web_search_call.action.sources" not in include_list
+        ):
+            include_list.append("web_search_call.action.sources")
+        payload: dict[str, Any] = {
+            "model": request_model,
+            "input": input_items,
+            "tools": tools_payload,
+            "tool_choice": "auto" if tool_choice is None else tool_choice,
+            "parallel_tool_calls": parallel_tool_calls is True,
+            "stream": True,
+            "store": False,
+            "include": include_list,
+        }
+        if instructions is not None:
+            if not isinstance(instructions, str):
+                raise ChatGPTOAuthInvalidRequestError("instructions must be a string when provided")
+            if instructions:
+                payload["instructions"] = instructions
+        if client_metadata is not None:
+            if not isinstance(client_metadata, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in client_metadata.items()
+            ):
+                raise ChatGPTOAuthInvalidRequestError(
+                    "client_metadata must be an object mapping strings to strings"
+                )
+            validated_metadata = dict(client_metadata)
+            for key in (SESSION_ID_KEY, THREAD_ID_KEY):
+                if key in validated_metadata and not validated_metadata[key].strip():
+                    raise ChatGPTOAuthInvalidRequestError(
+                        f"client_metadata.{key} must be a non-empty string when provided"
+                    )
+            metadata: dict[str, str] | None = validated_metadata
+        else:
+            metadata = None
+        if resolve_codex_metadata_enabled(codex_metadata):
+            try:
+                metadata = build_codex_client_metadata(
+                    auth_json_path=self.auth_json_path,
+                    existing=metadata,
+                )
+            except ValueError as exc:
+                raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
+        effective_prompt_cache_key = prompt_cache_key
+        if effective_prompt_cache_key is None and metadata is not None:
+            session_id = metadata.get(SESSION_ID_KEY)
+            if isinstance(session_id, str) and session_id.strip():
+                effective_prompt_cache_key = session_id
+        if effective_prompt_cache_key is not None:
+            payload["prompt_cache_key"] = _validate_non_empty_string(
+                effective_prompt_cache_key,
+                "prompt_cache_key",
+            )
+        if metadata is not None:
+            payload["client_metadata"] = metadata
+        _finalize_responses_payload(
+            payload,
+            capability=capability,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            reasoning_context=reasoning_context,
+            reasoning_summary=reasoning_summary,
+            allow_disabled_fallback=allow_disabled_fallback,
+            text=text,
+            verbosity=verbosity,
+            service_tier=service_tier,
+            responses_lite=responses_lite,
+            safety_identifier=safety_identifier,
+            prompt_cache_options=prompt_cache_options,
+        )
+        extra_headers: dict[str, str] = {}
+        if subagent is not None:
+            if (
+                not isinstance(subagent, str)
+                or not subagent
+                or not all("!" <= character <= "~" for character in subagent)
+            ):
+                raise ChatGPTOAuthInvalidRequestError(
+                    "subagent must contain only visible ASCII characters without spaces"
+                )
+            extra_headers["x-openai-subagent"] = subagent
+        if memgen_request is not None:
+            if not isinstance(memgen_request, bool):
+                raise ChatGPTOAuthInvalidRequestError("memgen_request must be a boolean when provided")
+            extra_headers["x-openai-memgen-request"] = "true" if memgen_request else "false"
+        return PreparedChatRequest(
+            payload=payload,
+            replay_input=tuple(deepcopy(input_items)),
+            snapshot=snapshot,
+            capability=capability,
+            extra_headers=extra_headers,
+        )
+
     def _responses_payload(
         self,
         messages: Sequence[Message],
@@ -2424,12 +2826,16 @@ def _finalize_responses_payload(
             if capability.default_reasoning_summary not in {None, "none"}
             else "auto"
         )
+    elif reasoning_summary in {"concise", "detailed"}:
+        effective_summary = reasoning_summary
     elif reasoning_summary in {"omitted", "none"}:
         effective_summary = "none"
     elif reasoning_summary is None:
         effective_summary = capability.default_reasoning_summary
     else:
-        raise ChatGPTOAuthInvalidRequestError("reasoning_summary must be 'auto', 'none', 'summarized', or 'omitted'")
+        raise ChatGPTOAuthInvalidRequestError(
+            "reasoning_summary must be 'auto', 'concise', 'detailed', 'none', 'summarized', or 'omitted'"
+        )
     if capability.supports_reasoning_summary_parameter and (
         effective_summary not in {None, "none"} or reasoning_summary in {"omitted", "none"}
     ):
@@ -2656,13 +3062,12 @@ def _responses_transport_headers(
     payload: dict[str, Any],
     *,
     catalog_key: CatalogKey | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> _TransportHeaders:
+    headers = dict(extra_headers) if extra_headers else {}
     if payload.pop("_codex_as_api_responses_lite", False) is True:
-        return _TransportHeaders(
-            {LITE_HEADER_NAME: LITE_HEADER_VALUE},
-            catalog_key=catalog_key,
-        )
-    return _TransportHeaders(catalog_key=catalog_key)
+        headers[LITE_HEADER_NAME] = LITE_HEADER_VALUE
+    return _TransportHeaders(headers, catalog_key=catalog_key)
 
 
 def _compact_raw_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2883,19 +3288,285 @@ def _web_search_event_from_response_item(
     if not isinstance(raw_action, dict):
         raise ChatGPTOAuthProtocolError("web_search_call requires an action object")
     action = cast(dict[str, Any], raw_action)
+    query = _web_search_query_from_action(action)
     sources = _web_search_sources_from_action(action)
     return {
         "type": "web_search_call",
         "id": tool_id,
-        "input": {"query": _web_search_query_from_action(action)},
+        "input": {"query": query},
         "content": sources,
     }
+
+
+def normalize_native_responses_input(
+    input_value: object,
+    *,
+    target_model: str | None = None,
+    allow_empty: bool = False,
+) -> list[dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+    if not isinstance(input_value, list):
+        raise ChatGPTOAuthInvalidRequestError("input must be a string or an array of items")
+    if not input_value and not allow_empty:
+        raise ChatGPTOAuthInvalidRequestError("input must be a non-empty string or array of items")
+    items: list[dict[str, Any]] = []
+    for index, raw_item in enumerate(input_value):
+        if not isinstance(raw_item, dict):
+            raise ChatGPTOAuthInvalidRequestError(f"input[{index}] must be an object")
+        if "type" in raw_item:
+            raw_type = raw_item["type"]
+            if not isinstance(raw_type, str) or not raw_type:
+                raise ChatGPTOAuthInvalidRequestError(f"input[{index}].type must be a non-empty string")
+            item_type = raw_type
+        elif isinstance(raw_item.get("role"), str):
+            item_type = "message"
+        else:
+            raise ChatGPTOAuthInvalidRequestError(f"input[{index}] requires a string type or role")
+        if item_type == "message":
+            role = raw_item.get("role")
+            if not isinstance(role, str) or role not in {"user", "assistant", "system", "developer"}:
+                raise ChatGPTOAuthInvalidRequestError(
+                    f"input[{index}].role must be one of: user, assistant, system, developer"
+                )
+            default_text_type = "output_text" if role == "assistant" else "input_text"
+            raw_content = raw_item.get("content")
+            if isinstance(raw_content, str):
+                content_parts: list[dict[str, Any]] = [{"type": default_text_type, "text": raw_content}]
+            elif isinstance(raw_content, list):
+                content_parts = []
+                for part_index, part in enumerate(raw_content):
+                    if not isinstance(part, dict):
+                        raise ChatGPTOAuthInvalidRequestError(
+                            f"input[{index}].content[{part_index}] must be an object"
+                        )
+                    part_type = part.get("type")
+                    if part_type in {"input_text", "output_text", "text"}:
+                        if not isinstance(part.get("text"), str):
+                            raise ChatGPTOAuthInvalidRequestError(
+                                f"input[{index}].content[{part_index}].text must be a string"
+                            )
+                        normalized_type = default_text_type if part_type == "text" else part_type
+                        content_parts.append({"type": normalized_type, "text": part["text"]})
+                    elif part_type == "input_image":
+                        image_url = part.get("image_url")
+                        if not isinstance(image_url, str) or not image_url.strip():
+                            raise ChatGPTOAuthInvalidRequestError(
+                                f"input[{index}].content[{part_index}].image_url must be a non-empty string"
+                            )
+                        image_part: dict[str, Any] = {"type": "input_image", "image_url": image_url}
+                        if part.get("detail") is not None:
+                            detail = part["detail"]
+                            if not isinstance(detail, str) or detail not in KNOWN_IMAGE_DETAILS:
+                                raise ChatGPTOAuthInvalidRequestError(
+                                    "image detail must be one of: auto, low, high, original"
+                                )
+                            image_part["detail"] = detail
+                        content_parts.append(image_part)
+                    else:
+                        raise ChatGPTOAuthInvalidRequestError(
+                            f"input[{index}].content[{part_index}].type {part_type!r} is not supported"
+                        )
+            else:
+                raise ChatGPTOAuthInvalidRequestError(f"input[{index}].content must be a string or array")
+            message_item: dict[str, Any] = {"type": "message", "role": role, "content": content_parts}
+            if isinstance(raw_item.get("id"), str) and raw_item["id"]:
+                message_item["id"] = raw_item["id"]
+            if isinstance(raw_item.get("status"), str) and raw_item["status"]:
+                message_item["status"] = raw_item["status"]
+            items.append(message_item)
+            continue
+        if item_type == "function_call":
+            if (
+                not isinstance(raw_item.get("call_id"), str)
+                or not raw_item["call_id"]
+                or not isinstance(raw_item.get("name"), str)
+                or not raw_item["name"]
+                or not isinstance(raw_item.get("arguments"), str)
+            ):
+                raise ChatGPTOAuthInvalidRequestError(
+                    f"input[{index}] function_call requires string call_id, name, and arguments"
+                )
+            call_item: dict[str, Any] = {
+                "type": "function_call",
+                "call_id": raw_item["call_id"],
+                "name": raw_item["name"],
+                "arguments": raw_item["arguments"],
+            }
+            if isinstance(raw_item.get("id"), str) and raw_item["id"]:
+                call_item["id"] = raw_item["id"]
+            if isinstance(raw_item.get("status"), str) and raw_item["status"]:
+                call_item["status"] = raw_item["status"]
+            items.append(call_item)
+            continue
+        if item_type == "function_call_output":
+            if not isinstance(raw_item.get("call_id"), str) or not raw_item["call_id"]:
+                raise ChatGPTOAuthInvalidRequestError(
+                    f"input[{index}] function_call_output requires string call_id"
+                )
+            if not isinstance(raw_item.get("output"), (str, list)):
+                raise ChatGPTOAuthInvalidRequestError(
+                    f"input[{index}] function_call_output requires string or array output"
+                )
+            output_item: dict[str, Any] = {
+                "type": "function_call_output",
+                "call_id": raw_item["call_id"],
+                "output": deepcopy(raw_item["output"]),
+            }
+            if isinstance(raw_item.get("id"), str) and raw_item["id"]:
+                output_item["id"] = raw_item["id"]
+            if isinstance(raw_item.get("status"), str) and raw_item["status"]:
+                output_item["status"] = raw_item["status"]
+            items.append(output_item)
+            continue
+        if item_type == "reasoning":
+            rest_item = deepcopy(raw_item)
+            item_model: str | None = None
+            if "model" in rest_item:
+                raw_model = rest_item.pop("model")
+                if not isinstance(raw_model, str) or not raw_model or raw_model.strip() != raw_model:
+                    raise ChatGPTOAuthInvalidRequestError(
+                        f"input[{index}].model must be a non-empty trimmed string"
+                    )
+                item_model = raw_model
+            encrypted_content = rest_item.get("encrypted_content")
+            if isinstance(encrypted_content, str) and encrypted_content:
+                try:
+                    validated = validate_replayable_reasoning_item({**rest_item, "type": "reasoning"})
+                except ValueError as exc:
+                    raise ChatGPTOAuthInvalidRequestError(str(exc)) from exc
+                if (
+                    item_model is not None
+                    and target_model
+                    and not is_reasoning_model_compatible(item_model, target_model)
+                ):
+                    continue
+                items.append(validated)
+                continue
+            rest_item["type"] = "reasoning"
+            _validate_compacted_history_item(rest_item, index=index, source="input")
+            items.append(rest_item)
+            continue
+        if item_type in {"compaction", "compaction_summary", "context_compaction", "agent_message"}:
+            _validate_compacted_history_item(raw_item, index=index, source="input")
+            items.append(deepcopy(raw_item))
+            continue
+        raise ChatGPTOAuthInvalidRequestError(
+            f"input[{index}].type {item_type!r} is not supported by the Codex OAuth Responses endpoint"
+        )
+    return items
+
+
+def normalize_native_responses_tools(
+    tools: Sequence[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if tools is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ChatGPTOAuthInvalidRequestError(f"tools[{index}] must be an object")
+        typ = tool.get("type")
+        if typ == "function":
+            raw_nested = tool.get("function")
+            if raw_nested is not None and not isinstance(raw_nested, dict):
+                raise ChatGPTOAuthInvalidRequestError(f"tools[{index}].function must be an object")
+            fn_source = raw_nested if isinstance(raw_nested, dict) else tool
+            name = fn_source.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ChatGPTOAuthInvalidRequestError(
+                    f"tools[{index}] function tool requires a non-empty name"
+                )
+            raw_parameters = fn_source.get("parameters")
+            if raw_parameters is None:
+                parameters: dict[str, Any] = {"type": "object", "properties": {}}
+            elif isinstance(raw_parameters, dict):
+                parameters = deepcopy(raw_parameters)
+            else:
+                raise ChatGPTOAuthInvalidRequestError(f"tools[{index}] function parameters must be an object")
+            raw_strict = fn_source.get("strict")
+            if raw_strict is None:
+                strict = False
+            elif isinstance(raw_strict, bool):
+                strict = raw_strict
+            else:
+                raise ChatGPTOAuthInvalidRequestError(f"tools[{index}] function strict must be a boolean")
+            raw_description = fn_source.get("description")
+            if raw_description is not None and not isinstance(raw_description, str):
+                raise ChatGPTOAuthInvalidRequestError(f"tools[{index}] function description must be a string")
+            normalized: dict[str, Any] = {
+                "type": "function",
+                "name": name,
+                "parameters": parameters,
+                "strict": strict,
+            }
+            if isinstance(raw_description, str):
+                normalized["description"] = raw_description
+            out.append(normalized)
+            continue
+        if typ in {"web_search", "web_search_preview", "web_search_preview_2025_03_11"}:
+            web_tool: dict[str, Any] = {"type": "web_search"}
+            search_context_size = tool.get("search_context_size")
+            if search_context_size is not None:
+                if not isinstance(search_context_size, str) or search_context_size not in {"low", "medium", "high"}:
+                    raise ChatGPTOAuthInvalidRequestError(
+                        f"tools[{index}].search_context_size must be low, medium, or high"
+                    )
+                web_tool["search_context_size"] = search_context_size
+            filters = tool.get("filters")
+            if filters is not None:
+                if not isinstance(filters, dict):
+                    raise ChatGPTOAuthInvalidRequestError(f"tools[{index}].filters must be an object")
+                web_tool["filters"] = deepcopy(filters)
+            user_location = tool.get("user_location")
+            if user_location is not None:
+                if not isinstance(user_location, dict):
+                    raise ChatGPTOAuthInvalidRequestError(f"tools[{index}].user_location must be an object")
+                web_tool["user_location"] = deepcopy(user_location)
+            out.append(web_tool)
+            continue
+        if typ == "image_generation":
+            out.append(deepcopy(tool))
+            continue
+        raise ChatGPTOAuthInvalidRequestError(
+            f"tools[{index}].type {typ!r} is not supported by the Codex OAuth transport"
+        )
+    return out
+
+
+def _optional_web_search_action_string(
+    action: dict[str, Any],
+    field: str,
+) -> str | None:
+    """Return a non-blank optional string field from a web_search_call action."""
+    value = action.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ChatGPTOAuthProtocolError(f"web_search_call action {field} must be a string")
+    return value if value.strip() else None
 
 
 def _web_search_query_from_action(action: dict[str, Any]) -> str:
     action_type = action.get("type")
     if not isinstance(action_type, str):
         raise ChatGPTOAuthProtocolError("web_search_call action type must be a string")
+    if action_type == "open_page":
+        url = _optional_web_search_action_string(action, "url")
+        return f"open_page: {url}" if url is not None else "open_page"
+    if action_type == "find_in_page":
+        pattern = _optional_web_search_action_string(action, "pattern")
+        url = _optional_web_search_action_string(action, "url")
+        if pattern is not None and url is not None:
+            return f"find_in_page: {pattern} ({url})"
+        detail = pattern if pattern is not None else url
+        return f"find_in_page: {detail}" if detail is not None else "find_in_page"
     if action_type != "search":
         raise ChatGPTOAuthProtocolError(
             f"web_search_call action type {action_type!r} cannot be represented by this facade"
@@ -2910,21 +3581,22 @@ def _web_search_query_from_action(action: dict[str, Any]) -> str:
     query = action.get("query")
     if query is not None and not isinstance(query, str):
         raise ChatGPTOAuthProtocolError("web_search_call action query must be a string")
-    if isinstance(queries, list) and len(queries) > 1:
-        raise ChatGPTOAuthProtocolError(
-            "web_search_call action contains multiple queries that cannot be represented by this facade"
-        )
-    if isinstance(query, str):
-        if isinstance(queries, list) and queries and queries[0] != query:
-            raise ChatGPTOAuthProtocolError("web_search_call action query conflicts with queries")
-        return query
     if isinstance(queries, list) and queries:
-        return cast(str, queries[0])
+        query_strings = cast(list[str], queries)
+        if isinstance(query, str) and query not in query_strings:
+            raise ChatGPTOAuthProtocolError("web_search_call action query conflicts with queries")
+        if len(query_strings) == 1:
+            return query if isinstance(query, str) else query_strings[0]
+        return " | ".join(query_strings)
+    if isinstance(query, str):
+        return query
     raise ChatGPTOAuthProtocolError("web_search_call action requires a query")
 
 
 def _web_search_sources_from_action(action: dict[str, Any]) -> list[dict[str, Any]]:
     sources = action.get("sources")
+    if sources is None and action.get("type") in {"open_page", "find_in_page"}:
+        return []
     if not isinstance(sources, list):
         raise ChatGPTOAuthProtocolError("web_search_call action requires a sources array")
     return _normalize_web_search_sources(sources)

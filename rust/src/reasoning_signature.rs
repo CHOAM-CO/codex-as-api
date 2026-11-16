@@ -285,6 +285,10 @@ pub fn parse_reasoning_signature_item(item_val: &Value) -> Result<ReasoningSigna
     })
 }
 
+pub fn validate_replayable_reasoning_item(raw_item: &Value) -> Result<Value, String> {
+    parse_reasoning_signature_item(raw_item).map(|item| item.to_value())
+}
+
 pub fn normalize_reasoning_item_for_replay(
     raw_entry: &Value,
     target_model: Option<&str>,

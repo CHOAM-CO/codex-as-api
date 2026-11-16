@@ -392,8 +392,8 @@ describe("anthropicRequestToInternal", () => {
     }), ChatGPTOAuthInvalidRequestError);
   });
 
-  it("rejects non-text tool_result blocks that cannot be represented", () => {
-    assert.throws(() => anthropicRequestToInternal({
+  it("accepts non-text tool_result blocks (search_result and document)", () => {
+    const { messages } = anthropicRequestToInternal({
       model: "test",
       messages: [{
         role: "user",
@@ -406,7 +406,10 @@ describe("anthropicRequestToInternal", () => {
           ],
         }],
       }],
-    }), ChatGPTOAuthInvalidRequestError);
+    });
+    assert.equal(messages.length, 1);
+    assert.ok(messages[0].content.includes("Docs"));
+    assert.ok(messages[0].content.includes("document body"));
   });
 
   it("tools conversion", () => {
@@ -577,25 +580,49 @@ describe("anthropicRequestToInternal", () => {
     assert.deepEqual(toolChoice, { type: "function", name: "get_weather" });
   });
 
-  it("rejects Anthropic hosted web_search tools", () => {
-    for (const tool of [
-      { type: "web_search", name: "web_search" },
-      { type: "web_search_20250305", name: "web_search", blocked_domains: ["example.com"] },
-      {
+  it("maps Anthropic hosted web_search tools and rejects unsupported domain blocks", () => {
+    const basic = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "web_search", name: "web_search" }],
+    });
+    assert.deepEqual(basic.tools, [{
+      name: "web_search",
+      parameters: {
+        __codex_as_api_tool_type: "web_search",
+        openai_tool: { type: "web_search" },
+      },
+    }]);
+
+    const configured = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{
         type: "web_search_20260209",
         name: "web_search",
         allowed_domains: ["example.com"],
         max_uses: 8,
         strict: false,
         user_location: { type: "approximate", country: "US" },
+      }],
+    });
+    assert.deepEqual(configured.tools, [{
+      name: "web_search",
+      parameters: {
+        __codex_as_api_tool_type: "web_search",
+        openai_tool: {
+          type: "web_search",
+          filters: { allowed_domains: ["example.com"] },
+          user_location: { type: "approximate", country: "US" },
+        },
       },
-    ]) {
-      assert.throws(() => anthropicRequestToInternal({
-        model: "test",
-        messages: [{ role: "user", content: "hi" }],
-        tools: [tool],
-      }), /cannot be represented losslessly/);
-    }
+    }]);
+
+    assert.throws(() => anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "web_search_20250305", name: "web_search", blocked_domains: ["example.com"] }],
+    }), ChatGPTOAuthInvalidRequestError);
   });
 
   it("rejects unknown Anthropic web_search tool versions", () => {
@@ -608,12 +635,64 @@ describe("anthropicRequestToInternal", () => {
     }
   });
 
-  it("rejects web_search tool_choice", () => {
-    assert.throws(() => anthropicRequestToInternal({
+  it("maps web_search tool_choice and renders document/search_result/web_search history blocks", () => {
+    const converted = anthropicRequestToInternal({
       model: "test",
-      messages: [{ role: "user", content: "hi" }],
+      stopSequences: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              title: "Readme",
+              context: "repo",
+              citations: { enabled: false },
+              source: { type: "text", media_type: "text/plain", data: "doc body" },
+            },
+            {
+              type: "search_result",
+              source: "https://example.com/doc",
+              title: "Example Doc",
+              citations: { enabled: false },
+              content: [{ type: "text", text: "snippet", citations: [] }],
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "server_tool_use",
+              id: "srvtoolu_1",
+              name: "web_search",
+              input: { query: "rust tokio" },
+              caller: { type: "direct" },
+            },
+            {
+              type: "web_search_tool_result",
+              tool_use_id: "srvtoolu_1",
+              caller: { type: "direct" },
+              content: [{
+                type: "web_search_result",
+                url: "https://tokio.rs",
+                title: "Tokio",
+                encrypted_content: "enc",
+              }],
+            },
+            { type: "text", text: "Done.", citations: [] },
+          ],
+        },
+      ],
       toolChoice: { type: "tool", name: "web_search" },
-    }), /cannot be represented losslessly/);
+    });
+    assert.deepEqual(converted.toolChoice, { type: "web_search" });
+    assert.equal(converted.stop, null);
+    assert.equal(converted.messages.length, 2);
+    assert.equal(converted.messages[0].content.includes("doc body"), true);
+    assert.equal(converted.messages[0].content.includes("snippet"), true);
+    assert.equal(converted.messages[1].content.includes("rust tokio"), true);
+    assert.equal(converted.messages[1].content.includes("https://tokio.rs"), true);
   });
 
   it("tool_choice none", () => {
@@ -1243,7 +1322,7 @@ describe("internalResponseToAnthropic", () => {
     assert.equal(usage.cache_creation_input_tokens, null);
   });
 
-  it("rejects web_search provider output", () => {
+  it("maps web_search provider output into server_tool_use and web_search_tool_result blocks", () => {
     const resp = makeResponse({
       content: "Final answer",
       usage: makeUsage(),
@@ -1256,10 +1335,36 @@ describe("internalResponseToAnthropic", () => {
         }],
       },
     });
-    assert.throws(
-      () => internalResponseToAnthropic(resp, "m", "msg_1"),
-      /cannot be represented losslessly/,
-    );
+    const converted = internalResponseToAnthropic(resp, "m", "msg_1");
+    assert.deepEqual(converted.content, [
+      {
+        type: "server_tool_use",
+        id: "srvtoolu_ws1",
+        name: "web_search",
+        input: { query: "latest news" },
+        caller: { type: "direct" },
+      },
+      {
+        type: "web_search_tool_result",
+        tool_use_id: "srvtoolu_ws1",
+        content: [{
+          type: "web_search_result",
+          url: "https://example.com",
+          title: "Example",
+          encrypted_content: "",
+        }],
+        caller: { type: "direct" },
+      },
+      {
+        type: "text",
+        text: "Final answer",
+        citations: null,
+      },
+    ]);
+    assert.deepEqual((converted.usage as Record<string, unknown>).server_tool_use, {
+      web_search_requests: 1,
+      web_fetch_requests: 0,
+    });
   });
 
   it("rejects malformed actual non-stream server tool usage", () => {
@@ -1661,7 +1766,7 @@ describe("anthropicStreamAdapter", () => {
     assert.equal(blockStarts[1].index, 1);
   });
 
-  it("rejects web_search_call stream output", async () => {
+  it("streams web_search_call events as server_tool_use and web_search_tool_result SSE blocks", async () => {
     const events = [
       {
         type: "web_search_call",
@@ -1672,10 +1777,18 @@ describe("anthropicStreamAdapter", () => {
       { type: "content", text: "It is noon." },
       { type: "finish", finish_reason: "stop", usage: makeStreamUsage() },
     ];
-    await assert.rejects(
-      () => collectStreamEvents(events),
-      /cannot be represented losslessly/,
-    );
+    const parsed = await collectStreamEvents(events);
+    const blockStarts = parsed.filter((e) => e.type === "content_block_start");
+    assert.equal(blockStarts.length, 3);
+    assert.equal((blockStarts[0].content_block as Record<string, unknown>).type, "server_tool_use");
+    assert.equal((blockStarts[1].content_block as Record<string, unknown>).type, "web_search_tool_result");
+    assert.equal((blockStarts[2].content_block as Record<string, unknown>).type, "text");
+    const messageDelta = parsed.find((e) => e.type === "message_delta");
+    assert.ok(messageDelta);
+    assert.deepEqual((messageDelta.usage as Record<string, unknown>).server_tool_use, {
+      web_search_requests: 1,
+      web_fetch_requests: 0,
+    });
   });
 });
 

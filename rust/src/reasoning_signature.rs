@@ -10,7 +10,10 @@ pub const REASONING_SIGNATURE_PREFIX: &str = "codex-reasoning-v1:";
 const REASONING_SIGNATURE_RECOGNITION_PREFIX: &str = "codex-reasoning";
 const REASONING_SIGNATURE_UNDERSCORE_PREFIX: &str = "codex_reasoning";
 
-pub const REASONING_COMPATIBLE_MODELS: [&str; 5] = [
+pub const REASONING_COMPATIBLE_MODELS: [&str; 8] = [
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "gpt-6.1-terra",
     "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
@@ -667,7 +670,7 @@ mod tests {
                 None
             );
         }
-        assert_eq!(pair_count, 25);
+        assert_eq!(pair_count, 64);
 
         let exact_outside = json!({
             "v": 1,

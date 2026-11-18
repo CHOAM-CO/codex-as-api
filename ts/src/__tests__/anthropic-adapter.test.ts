@@ -88,6 +88,51 @@ describe("anthropicRequestToInternal", () => {
     assert.equal(messages[1].role, MessageRole.USER);
   });
 
+  it("keeps system history turns in place as developer messages", () => {
+    const { messages } = anthropicRequestToInternal({
+      model: "test",
+      system: "Initial instructions",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "system", content: "Runtime note" },
+        { role: "assistant", content: "hello" },
+        { role: "system", content: [{ type: "text", text: "More instructions" }] },
+        { role: "system", content: [] },
+      ],
+    });
+    assert.deepEqual(messages.map(({ role, content }) => [role, content]), [
+      [MessageRole.SYSTEM, "Initial instructions"],
+      [MessageRole.USER, "hi"],
+      [MessageRole.DEVELOPER, "Runtime note"],
+      [MessageRole.ASSISTANT, "hello"],
+      [MessageRole.DEVELOPER, "More instructions"],
+    ]);
+  });
+
+  it("strips nested Unicode property patterns without changing other schema fields", () => {
+    const pattern = String.raw`^\p{Letter}+$`;
+    const inputSchema = {
+      type: "object",
+      properties: {
+        word: { type: "string", pattern, minLength: 2 },
+        other: { anyOf: [{ pattern: String.raw`\P{Letter}` }, { pattern: "^[0-9]+$" }] },
+      },
+    };
+    const { tools } = anthropicRequestToInternal({
+      model: "test",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "lookup", input_schema: inputSchema }],
+    });
+    assert.deepEqual(tools?.[0].parameters, {
+      type: "object",
+      properties: {
+        word: { type: "string", minLength: 2 },
+        other: { anyOf: [{}, { pattern: "^[0-9]+$" }] },
+      },
+    });
+    assert.equal(inputSchema.properties.word.pattern, pattern);
+  });
+
   it("system content blocks", () => {
     const { messages } = anthropicRequestToInternal({
       model: "test",
@@ -2022,6 +2067,9 @@ describe("reasoning signature codec and encrypted reasoning preservation", () =>
   it("allows replay across all 25 compatible model pairs and drops outside-set mismatches", () => {
     const compatibleModels = [...REASONING_COMPATIBLE_MODELS];
     assert.deepEqual(compatibleModels, [
+      "gpt-6.2-sol",
+      "gpt-6.2-astra",
+      "gpt-6.1-terra",
       "gpt-6.1-sol",
       "gpt-6-astra",
       "gpt-6-sol",
@@ -2083,7 +2131,7 @@ describe("reasoning signature codec and encrypted reasoning preservation", () =>
         );
       }
     }
-    assert.equal(pairCount, 25);
+    assert.equal(pairCount, 64);
 
     // Exact match outside the 5-model set is also allowed
     assert.equal(isReasoningModelCompatible("gpt-5.5", "gpt-5.5"), true);

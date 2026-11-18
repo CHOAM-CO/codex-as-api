@@ -6,6 +6,7 @@ import base64
 import json
 
 import pytest
+from fastapi.testclient import TestClient
 
 from codex_as_api.anthropic_adapter import (
     anthropic_parallel_tool_calls,
@@ -16,12 +17,14 @@ from codex_as_api.anthropic_adapter import (
     resolve_anthropic_thinking_options,
 )
 from codex_as_api.auth import ChatGPTOAuthProtocolError
+from codex_as_api.codex_config import CodexConfig
 from codex_as_api.messages import (
     AssistantResponse,
     MessageRole,
     ToolCall,
     Usage,
 )
+from codex_as_api.provider import ChatGPTOAuthProvider
 from codex_as_api.reasoning_signature import (
     REASONING_COMPATIBLE_MODELS,
     REASONING_SIGNATURE_PREFIX,
@@ -47,6 +50,49 @@ class TestAnthropicRequestToInternal:
         assert messages[0].role is MessageRole.SYSTEM
         assert messages[0].content == "You are helpful."
         assert messages[1].role is MessageRole.USER
+
+    def test_system_messages_stay_in_place_as_developer_messages(self):
+        messages, *_ = anthropic_request_to_internal(
+            model="test",
+            system="Initial instructions",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Runtime note"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "system", "content": [{"type": "text", "text": "More instructions"}]},
+                {"role": "system", "content": []},
+            ],
+        )
+        assert [(message.role, message.content) for message in messages] == [
+            (MessageRole.SYSTEM, "Initial instructions"),
+            (MessageRole.USER, "hi"),
+            (MessageRole.DEVELOPER, "Runtime note"),
+            (MessageRole.ASSISTANT, "hello"),
+            (MessageRole.DEVELOPER, "More instructions"),
+        ]
+
+    def test_tool_schema_strips_nested_unicode_property_patterns_only(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string", "pattern": r"^\p{Letter}+$", "minLength": 2},
+                "other": {"anyOf": [{"pattern": r"\P{Letter}"}, {"pattern": "^[0-9]+$"}]},
+            },
+        }
+        _, tools, *_ = anthropic_request_to_internal(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"name": "lookup", "input_schema": schema}],
+        )
+        assert tools is not None
+        assert tools[0].parameters == {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string", "minLength": 2},
+                "other": {"anyOf": [{}, {"pattern": "^[0-9]+$"}]},
+            },
+        }
+        assert schema["properties"]["word"]["pattern"] == r"^\p{Letter}+$"
 
     @pytest.mark.parametrize(
         "tool",
@@ -2474,6 +2520,9 @@ class TestReasoningSignatureAndAnthropicAdapter:
 
     def test_reasoning_compatible_models_25_pair_matrix_and_outside_set_drop(self):
         expected_compatible_models = {
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-terra",
             "gpt-6.1-sol",
             "gpt-6-astra",
             "gpt-6-sol",
@@ -2482,7 +2531,7 @@ class TestReasoningSignatureAndAnthropicAdapter:
         }
         assert set(REASONING_COMPATIBLE_MODELS) == expected_compatible_models
         compatible_models = sorted(REASONING_COMPATIBLE_MODELS)
-        assert len(compatible_models) == 5
+        assert len(compatible_models) == 8
 
         pair_count = 0
         for source_model in compatible_models:
@@ -2523,7 +2572,7 @@ class TestReasoningSignatureAndAnthropicAdapter:
                 )
                 assert len(messages[0].reasoning_items) == 1
                 assert messages[0].reasoning_items[0] == extracted
-        assert pair_count == 25
+        assert pair_count == 64
 
         outside_models = ["gpt-5.6-sol", "gpt-5.5", "claude-sonnet-4-5"]
         for outside_model in outside_models:
@@ -2587,3 +2636,84 @@ class TestReasoningSignatureAndAnthropicAdapter:
                 )
         for foreign in ("ErUBCkYICBgCIk...", "anthropic-signature", "other_prefix.v1.payload"):
             assert is_recognized_reasoning_signature(foreign) is False
+
+
+
+def test_messages_sampling_model_overrides_and_usage_logs(monkeypatch, tmp_path, model_catalog_snapshot):
+    from codex_as_api import server
+
+    for suffix in ("SUBAGENT_MODEL", "COMPACT_MODEL", "FALLBACK_ON_UNKNOWN_MODEL", "USAGE_LOG"):
+        monkeypatch.delenv(f"CODEX_AS_API_{suffix}", raising=False)
+    monkeypatch.delenv("MAGI_USAGE_LOG", raising=False)
+    monkeypatch.setattr(server, "CODEX_CONFIG", CodexConfig(codex_home="/tmp", config_path="/tmp/config.toml"))
+    provider = ChatGPTOAuthProvider(model="gpt-5.5")
+    monkeypatch.setattr(server, "_provider", provider)
+    monkeypatch.setattr(provider, "get_model_catalog", lambda: model_catalog_snapshot)
+    monkeypatch.setattr(provider, "preflight_chat", lambda *_args, **_kwargs: None)
+    routed = []
+
+    def chat(_messages, *, model, **_opts):
+        routed.append(model)
+        return AssistantResponse(
+            content="done", finish_reason="stop",
+            usage=Usage(prompt_tokens=11, completion_tokens=3, total_tokens=14, cached_tokens=2),
+        )
+
+    def stream_chat(_messages, *, model, **_opts):
+        routed.append(model)
+        yield {"type": "finish", "finish_reason": "stop", "usage": {
+            "input_tokens": 11, "output_tokens": 3, "total_tokens": 14,
+            "input_tokens_details": {"cached_tokens": 2},
+        }}
+
+    def compact(_messages, *, model, **_opts):
+        routed.append(model)
+        return "checkpoint"
+
+    monkeypatch.setattr(provider, "chat", chat)
+    monkeypatch.setattr(provider, "chat_stream", stream_chat)
+    monkeypatch.setattr(provider, "compact_messages", compact)
+    with TestClient(server.app) as client:
+        body = {"max_tokens": 32, "messages": [{"role": "user", "content": "hello"}]}
+        assert client.post("/v1/messages", json=body).status_code == 400
+        assert client.post("/v1/messages", json={**body, "model": "not-in-catalog"}).status_code == 404
+        monkeypatch.setenv("CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL", " YeS ")
+        assert client.post("/v1/messages", json=body).json()["model"] == "gpt-5.5"
+        assert client.post("/v1/messages", json={**body, "model": "not-in-catalog"}).status_code == 200
+        assert client.post("/v1/messages/count_tokens", json=body).status_code == 200
+        assert client.post("/v1/messages/compact", json=body).status_code == 200
+
+        monkeypatch.setenv("CODEX_AS_API_SUBAGENT_MODEL", "gpt-5.6-terra")
+        monkeypatch.setenv("CODEX_AS_API_COMPACT_MODEL", "gpt-5.6-sol")
+        claude = {**body, "model": "claude-test"}
+        assert client.post("/v1/messages/compact", json=claude).json()["checkpoint"] == "checkpoint"
+        summary = {**claude, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Create a detailed summary of the conversation so far."},
+        ]}]}
+        assert client.post("/v1/messages", json=summary).status_code == 200
+
+        log_dir = tmp_path / "usage"
+        primary_log = log_dir / "primary.jsonl"
+        alias_log = log_dir / "alias.jsonl"
+        monkeypatch.setenv("CODEX_AS_API_USAGE_LOG", str(primary_log))
+        monkeypatch.setenv("MAGI_USAGE_LOG", str(alias_log))
+        response = client.post("/v1/messages", json={
+            **claude, "temperature": 0.4, "top_p": 0.8, "top_k": 10, "prompt_cache_key": "explicit",
+        })
+        assert response.status_code == 200, response.text
+        assert response.json()["model"] == "claude-test"
+        assert not alias_log.exists()
+        monkeypatch.delenv("CODEX_AS_API_USAGE_LOG")
+        response = client.post("/v1/messages", json={**claude, "stream": True})
+        assert "event: message_stop" in response.text
+
+    assert routed == [
+        "gpt-5.5", "gpt-5.5", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-terra",
+    ]
+    for path, key, key_src in ((primary_log, "explicit", "body"), (alias_log, None, "none")):
+        [row] = [json.loads(line) for line in path.read_text().splitlines()]
+        assert row["ts"]
+        assert row["model"] == "claude-test"
+        assert row["backend_model"] == "gpt-5.6-terra"
+        assert (row["input_tokens"], row["output_tokens"], row["cache_read_input_tokens"]) == (9, 3, 2)
+        assert (row["key"], row["key_src"]) == (key, key_src)

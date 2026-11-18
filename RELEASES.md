@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.0.1
+
+### GPT-6.2 reasoning replay and Anthropic/Claude Code compatibility
+
+- Extend signed reasoning replay to GPT-6.2 Sol, GPT-6.2 Astra, and GPT-6.1 Terra.
+- Accept `system` messages within Anthropic conversation history as in-place developer instructions.
+- Accept `temperature`, `top_p`, and `top_k` on `/v1/messages` for SDK compatibility; Codex does not apply these sampling controls.
+- Strip Unicode property escape patterns (`\p{...}` and `\P{...}`) from Anthropic tool schemas for upstream compatibility.
+- Opt into Anthropic model routing with `CODEX_AS_API_SUBAGENT_MODEL` for `claude-*` models, `CODEX_AS_API_COMPACT_MODEL` for compaction, and `CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL` for unknown or omitted models.
+- Append usage records for completed streaming and non-streaming `/v1/messages` requests to the JSONL file set by `CODEX_AS_API_USAGE_LOG` (or `MAGI_USAGE_LOG`).
+- Image generation accepts partial image items and empty assistant placeholders, and returns redacted protocol diagnostics for malformed upstream responses. TypeScript and Rust no longer inherit text-model reasoning defaults for images; Python keeps its existing default, and all three still accept explicit reasoning.
+
 ## v1.0.0
 
 ### Native OpenAI Responses HTTP endpoints, hosted Anthropic WebSearch bridge, and SDK default compatibility across Python, TypeScript, and Rust

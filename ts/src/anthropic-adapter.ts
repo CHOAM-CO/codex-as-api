@@ -81,6 +81,16 @@ export function anthropicRequestToInternal(opts: {
       convertUserMessage(content, internalMessages);
     } else if (role === "assistant") {
       convertAssistantMessage(content, internalMessages, opts.backendModel);
+    } else if (role === "system") {
+      if (typeof content !== "string" && !Array.isArray(content)) {
+        throw new ChatGPTOAuthInvalidRequestError(
+          `message ${messageIndex} content must be a string or array`,
+        );
+      }
+      const devText = extractSystemText(content);
+      if (devText) {
+        internalMessages.push({ role: MessageRole.DEVELOPER, content: devText });
+      }
     } else {
       throw new ChatGPTOAuthInvalidRequestError(
         `message ${messageIndex} role must be one of: user, assistant`,
@@ -733,7 +743,7 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
     }
     result.push({
       name,
-      parameters: requireRecord(tool.input_schema, `tool ${index} input_schema`),
+      parameters: sanitizeToolSchema(requireRecord(tool.input_schema, `tool ${index} input_schema`)),
       ...(!Object.hasOwn(tool, "description")
         ? {}
         : { description: requireString(tool.description, `tool ${index} description`) }),
@@ -741,6 +751,24 @@ function convertTools(tools: Record<string, unknown>[]): ToolSchema[] {
     });
   }
   return result;
+}
+
+function sanitizeToolSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const sanitizeValue = (val: unknown): unknown => {
+    if (Array.isArray(val)) return val.map(sanitizeValue);
+    if (val !== null && typeof val === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+        if (k === "pattern" && typeof v === "string" && /\\[pP]\{/.test(v)) {
+          continue;
+        }
+        out[k] = sanitizeValue(v);
+      }
+      return out;
+    }
+    return val;
+  };
+  return sanitizeValue(schema) as Record<string, unknown>;
 }
 
 function convertAnthropicWebSearchTool(

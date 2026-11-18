@@ -35,6 +35,7 @@ def anthropic_request_to_internal(
     output_config: object = None,
     metadata: object = None,
     backend_model: str | None = None,
+    allow_missing_model: bool = False,
 ) -> tuple[
     list[Message], list[ToolSchema] | None, str | dict | None, list[str] | None, str | None, dict[str, Any] | None
 ]:
@@ -42,7 +43,7 @@ def anthropic_request_to_internal(
 
     Returns (messages, tools, tool_choice, stop, reasoning_effort, text).
     """
-    if not isinstance(model, str) or not model:
+    if not (model is None and allow_missing_model) and (not isinstance(model, str) or not model):
         raise ValueError("model must be a non-empty string")
     if backend_model is not None and (
         not isinstance(backend_model, str) or not backend_model or backend_model != backend_model.strip()
@@ -75,6 +76,12 @@ def anthropic_request_to_internal(
             _convert_user_message(content, internal_messages)
         elif role == "assistant":
             _convert_assistant_message(content, internal_messages, backend_model=backend_model)
+        elif role == "system":
+            if not isinstance(content, (str, list)):
+                raise ValueError(f"messages[{index}].content must be a string or array")
+            dev_text = _extract_system_text(content)
+            if dev_text:
+                internal_messages.append(Message(role=MessageRole.DEVELOPER, content=dev_text))
         else:
             raise ValueError(f"messages[{index}].role must be user or assistant")
 
@@ -446,12 +453,24 @@ def _tool_strict(tool: dict[str, Any], index: int) -> bool:
     return strict
 
 
+def _sanitize_tool_schema(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_sanitize_tool_schema(item) for item in value]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k == "pattern" and isinstance(v, str) and re.search(r"\\[pP]\{", v):
+                continue
+            out[k] = _sanitize_tool_schema(v)
+        return out
+    return value
+
+
 def _required_tool_schema(tool: dict[str, Any], index: int) -> dict[str, Any]:
     schema = tool.get("input_schema")
     if not isinstance(schema, dict):
         raise ValueError(f"Anthropic tool {index} input_schema must be an object")
-    return schema
-
+    return cast(dict[str, Any], _sanitize_tool_schema(schema))
 
 def _convert_anthropic_web_search_tool(tool: dict[str, Any], index: int) -> ToolSchema | None:
     if (

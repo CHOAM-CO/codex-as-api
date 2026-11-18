@@ -1,4 +1,6 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import express, { type NextFunction, type Request, type Response } from "express";
 import {
@@ -645,18 +647,78 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     (typeof provider.resolveClientVersion === "function"
       ? () => provider.resolveClientVersion()
       : undefined);
+  const isUnknownModelFallbackEnabled = (): boolean => {
+    const raw = (process.env.CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL ?? "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+  };
+  const isAnthropicAutoCompactBody = (rawBody: Record<string, unknown> | undefined): boolean => {
+    if (!rawBody) return false;
+    const msgs = rawBody.messages;
+    if (!Array.isArray(msgs) || msgs.length === 0) return false;
+    const last = msgs[msgs.length - 1];
+    const text = typeof last === "object" && last !== null ? JSON.stringify((last as Record<string, unknown>).content ?? "") : "";
+    return /create a detailed summary of the conversation so far/i.test(text);
+  };
+  const appendAnthropicUsageLog = (opts: {
+    model: string;
+    backendModel: string;
+    usage: Record<string, unknown> | undefined;
+    promptCacheKey: string | undefined;
+    keySrc: string;
+  }): void => {
+    const logPath = process.env.CODEX_AS_API_USAGE_LOG?.trim() || process.env.MAGI_USAGE_LOG?.trim();
+    if (!logPath || !opts.usage) return;
+    const row = {
+      ts: new Date().toISOString(),
+      port: String(process.env.CODEX_AS_API_PORT || 18080),
+      model: opts.model,
+      backend_model: opts.backendModel,
+      input_tokens: (opts.usage.input_tokens as number | null | undefined) ?? 0,
+      output_tokens: (opts.usage.output_tokens as number | null | undefined) ?? 0,
+      cache_read_input_tokens: (opts.usage.cache_read_input_tokens as number | null | undefined) ?? 0,
+      cache_creation_input_tokens: (opts.usage.cache_creation_input_tokens as number | null | undefined) ?? 0,
+      key: opts.promptCacheKey ?? null,
+      key_src: opts.keySrc,
+    };
+    try {
+      fs.mkdirSync(path.dirname(logPath), { recursive: true });
+      fs.appendFileSync(logPath, `${JSON.stringify(row)}\n`, "utf8");
+    } catch {
+      // Ignore usage log write errors so requests never fail on logging.
+    }
+  };
   const prepareAnthropicRouteModel = async (
     requestedModel: string | undefined,
+    routeOpts?: { isCompact?: boolean; rawBody?: Record<string, unknown> },
   ) => {
+    const compactOverride = (process.env.CODEX_AS_API_COMPACT_MODEL ?? "").trim();
+    if (compactOverride && (routeOpts?.isCompact || isAnthropicAutoCompactBody(routeOpts?.rawBody))) {
+      return provider.prepareModel(compactOverride);
+    }
     if (requestedModel == null) {
+      if (isUnknownModelFallbackEnabled()) {
+        return provider.prepareModel(undefined);
+      }
       throw new ChatGPTOAuthInvalidRequestError(
         "Anthropic-compatible routes require an explicit model",
       );
     }
     validateModelValue(requestedModel, "model");
-    return requestedModel.startsWith("claude-")
-      ? provider.prepareAnthropicModel(requestedModel)
-      : provider.prepareModel(requestedModel);
+    if (requestedModel.startsWith("claude-")) {
+      const subagentOverride = (process.env.CODEX_AS_API_SUBAGENT_MODEL ?? "").trim();
+      if (subagentOverride) {
+        return provider.prepareModel(subagentOverride);
+      }
+      return provider.prepareAnthropicModel(requestedModel);
+    }
+    try {
+      return await provider.prepareModel(requestedModel);
+    } catch (err) {
+      if (err instanceof ChatGPTOAuthModelNotFoundError && isUnknownModelFallbackEnabled()) {
+        return provider.prepareModel(undefined);
+      }
+      throw err;
+    }
   };
 
   const app = express();
@@ -1467,12 +1529,10 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         const responsesLite = optionalBooleanOrString(body.responses_lite, "responses_lite");
         const preparedModel = await provider.prepareModel(optionalModel(body.model) ?? model);
         const requestModel = preparedModel.slug;
-        const reasoning = resolveReasoning(
-          body.reasoning,
-          body.reasoning_effort,
-          codexConfig,
-          preparedModel.capability,
-        );
+        // Keep explicitly requested reasoning, but do not inherit text-model defaults.
+        const reasoning = body.reasoning != null || body.reasoning_effort != null
+          ? resolveReasoning(body.reasoning, body.reasoning_effort, codexConfig, preparedModel.capability)
+          : undefined;
         const images = await provider.generateImage(body.prompt, {
           model: requestModel,
           size,
@@ -1489,7 +1549,16 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         }));
         res.json({ created: Math.floor(Date.now() / 1000), data });
       } catch (err) {
-        handleError(err, res);
+        if (err instanceof ChatGPTOAuthProtocolError) {
+          const detail = err.message.replace(/[A-Za-z0-9_-]{32,}/g, "[redacted]").slice(0, 500);
+          res.status(502).json({ error: {
+            message: `upstream protocol validation failed: ${detail}`,
+            type: "upstream_protocol_error",
+            code: "upstream_protocol_error",
+          } });
+        } else {
+          handleError(err, res);
+        }
       }
     },
   );
@@ -1584,7 +1653,7 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         isAnthropicCompact,
       );
       const preparedModel = isAnthropicCompact
-        ? await prepareAnthropicRouteModel(requestedModel)
+        ? await prepareAnthropicRouteModel(requestedModel, { isCompact: true, rawBody })
         : await provider.prepareModel(requestedModel ?? model);
       const requestModel = preparedModel.slug;
       filterMessagesReasoningItemsForModel(messages, requestModel);
@@ -1688,11 +1757,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
     try {
       const claudeCodeSessionId = resolveClaudeCodeSessionId(req);
       const rawBody = requireRequestBody(req.body);
-      rejectAnthropicUnsupportedFieldPresence(rawBody, [
-        "temperature",
-        "top_p",
-        "top_k",
-      ]);
+      for (const k of ["temperature", "top_p", "top_k"]) {
+        delete rawBody[k];
+      }
       validateAnthropicMetadata(rawBody.metadata);
       rejectExplicitNullAnthropicFields(rawBody);
       const body = stripAnthropicCacheControls(rawBody);
@@ -1767,8 +1834,9 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         );
       }
 
-      const preparedModel = await prepareAnthropicRouteModel(clientModel);
+      const preparedModel = await prepareAnthropicRouteModel(clientModel, { rawBody: body });
       const requestModel = preparedModel.slug;
+      const displayClientModel = clientModel ?? requestModel;
       filterMessagesReasoningItemsForModel(messages, requestModel);
       const requestedReasoningEffort = mergeAnthropicReasoningEffort(
         body.reasoning_effort,
@@ -1828,12 +1896,33 @@ export function createApp(opts?: CreateAppOptions): express.Express {
           res.setHeader("Cache-Control", "no-cache");
           res.setHeader("Connection", "keep-alive");
 
+          const keySrc = explicitPromptCacheKey != null ? "body" : claudeCodeSessionId != null ? "cc-session" : "none";
           for await (const chunk of anthropicStreamAdapter(
             responseStream,
-            clientModel!,
+            displayClientModel,
             requestId,
             responseOpts,
           )) {
+            if (chunk.startsWith("event: message_delta\n")) {
+              for (const line of chunk.split("\n")) {
+                if (line.startsWith("data: ")) {
+                  try {
+                    const parsed = JSON.parse(line.slice(6)) as Record<string, unknown>;
+                    if (isRecord(parsed.usage)) {
+                      appendAnthropicUsageLog({
+                        model: displayClientModel,
+                        backendModel: requestModel,
+                        usage: parsed.usage,
+                        promptCacheKey,
+                        keySrc,
+                      });
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
+              }
+            }
             await writeWithBackpressure(res, chunk, downstream.controller.signal);
           }
           res.end();
@@ -1843,7 +1932,18 @@ export function createApp(opts?: CreateAppOptions): express.Express {
         }
       } else {
         const response = await provider.chat(messages, chatOpts);
-        res.json(internalResponseToAnthropic(response, clientModel!, requestId, responseOpts));
+        const result = internalResponseToAnthropic(response, displayClientModel, requestId, responseOpts);
+        const keySrc = explicitPromptCacheKey != null ? "body" : claudeCodeSessionId != null ? "cc-session" : "none";
+        if (isRecord(result.usage)) {
+          appendAnthropicUsageLog({
+            model: displayClientModel,
+            backendModel: requestModel,
+            usage: result.usage,
+            promptCacheKey,
+            keySrc,
+          });
+        }
+        res.json(result);
       }
     } catch (err) {
       handleAnthropicError(err, res);

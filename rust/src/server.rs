@@ -20,7 +20,8 @@ use std::time::Duration;
 use tokio::task;
 
 use crate::anthropic_adapter::{
-    anthropic_request_to_internal, anthropic_thinking_controls, format_anthropic_error,
+    anthropic_request_to_internal, anthropic_request_to_internal_for_model,
+    anthropic_thinking_controls, format_anthropic_error,
     internal_response_to_anthropic_with_options, validate_anthropic_cache_controls,
     AnthropicStreamAdapter,
 };
@@ -230,6 +231,25 @@ fn provider_error_response(error: &ProviderError) -> axum::response::Response {
     error_response_with_type(
         status,
         public_error_message(error),
+        provider_error_type(error),
+    )
+    .into_response()
+}
+
+fn image_generation_error_response(error: &ProviderError) -> Response {
+    let ProviderError::UpstreamProtocol(detail) = error else {
+        return provider_error_response(error);
+    };
+    static OPAQUE_VALUE: std::sync::LazyLock<fancy_regex::Regex> =
+        std::sync::LazyLock::new(|| fancy_regex::Regex::new(r"[A-Za-z0-9_-]{32,}").unwrap());
+    let detail: String = OPAQUE_VALUE
+        .replace_all(detail, "[redacted]")
+        .chars()
+        .take(500)
+        .collect();
+    error_response_with_type(
+        StatusCode::BAD_GATEWAY,
+        format!("{}: {detail}", public_error_message(error)),
         provider_error_type(error),
     )
     .into_response()
@@ -2575,7 +2595,8 @@ fn messages_from_compact_body(
         || body.get("stop_sequences").is_some()
     {
         let (messages, tools, tool_choice, _stop, reasoning_effort, text, parallel_tool_calls) =
-            anthropic_request_to_internal(body).map_err(ProviderError::InvalidRequest)?;
+            anthropic_request_to_internal_for_model(body, None)
+                .map_err(ProviderError::InvalidRequest)?;
         if !force_anthropic
             && tool_choice
                 .as_ref()
@@ -2692,27 +2713,119 @@ async fn resolve_route_model_typed(
     .map_err(|error| ProviderError::Request(format!("blocking provider task failed: {error}")))?
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn anthropic_auto_compact(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("content"))
+        .is_some_and(|content| {
+            content
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("create a detailed summary of the conversation so far")
+        })
+}
+
 async fn resolve_anthropic_route_model(
     state: &AppState,
-    requested: &str,
+    requested: Option<String>,
+    is_compact: bool,
+    messages_body: Option<&Value>,
 ) -> Result<ResolvedModel, ProviderError> {
-    if requested.trim().is_empty() || requested != requested.trim() {
+    if requested
+        .as_deref()
+        .is_some_and(|model| model.is_empty() || model != model.trim())
+    {
         return Err(ProviderError::InvalidRequest(
             "model must be a non-empty string without surrounding whitespace".to_string(),
         ));
     }
+    let compact_override = env_nonempty("CODEX_AS_API_COMPACT_MODEL")
+        .filter(|_| is_compact || messages_body.is_some_and(anthropic_auto_compact));
+    let fallback = env_nonempty("CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL").is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if requested.is_none() && compact_override.is_none() && !fallback {
+        return Err(ProviderError::InvalidRequest(
+            "model is required".to_string(),
+        ));
+    }
     let provider = state.provider.clone();
-    let requested = requested.to_string();
     task::spawn_blocking(move || {
+        if let Some(model) = compact_override {
+            return provider.resolve_model(Some(&model));
+        }
+        let Some(requested) = requested else {
+            return provider.configured_or_default_model();
+        };
         if requested.starts_with("claude-") {
-            let snapshot = provider.model_catalog_snapshot()?;
-            provider.configured_or_default_model_from_snapshot(snapshot)
-        } else {
-            provider.resolve_model(Some(&requested))
+            if let Some(model) = env_nonempty("CODEX_AS_API_SUBAGENT_MODEL") {
+                return provider.resolve_model(Some(&model));
+            }
+            return provider.configured_or_default_model();
+        }
+        match provider.resolve_model(Some(&requested)) {
+            Err(ProviderError::ModelNotFound(_)) if fallback => {
+                provider.configured_or_default_model()
+            }
+            resolved => resolved,
         }
     })
     .await
     .map_err(|error| ProviderError::Request(format!("blocking provider task failed: {error}")))?
+}
+
+fn append_anthropic_usage_log(
+    log_path: &str,
+    model: &str,
+    backend_model: &str,
+    usage: &Value,
+    prompt_cache_key: Option<&str>,
+    key_src: &str,
+) {
+    let Some(usage) = usage.as_object() else {
+        return;
+    };
+    let tokens = |field| usage.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let row = json!({
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "port": env_nonempty("CODEX_AS_API_PORT").unwrap_or_else(|| "18080".to_string()),
+        "model": model,
+        "backend_model": backend_model,
+        "input_tokens": tokens("input_tokens"),
+        "output_tokens": tokens("output_tokens"),
+        "cache_read_input_tokens": tokens("cache_read_input_tokens"),
+        "cache_creation_input_tokens": tokens("cache_creation_input_tokens"),
+        "key": prompt_cache_key,
+        "key_src": key_src,
+    });
+    let path = std::path::Path::new(log_path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // Best effort: logging failures must not affect the request.
+        let _ = std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes());
+    }
 }
 
 async fn models(State(state): State<AppState>) -> axum::response::Response {
@@ -3825,13 +3938,17 @@ async fn images_generations(
     )
     .map_err(|error| provider_error_response(&error))?;
     let resolved = resolve_route_model(&state, request.model.clone()).await?;
-    let reasoning_effort = effective_reasoning_effort_with_options(
-        &state,
-        request.reasoning_effort.as_deref(),
-        request.reasoning.as_ref(),
-        &resolved.model,
-    )
-    .map_err(|error| provider_error_response(&error))?;
+    let reasoning_effort = if request.reasoning_effort.is_some() || request.reasoning.is_some() {
+        effective_reasoning_effort_with_options(
+            &state,
+            request.reasoning_effort.as_deref(),
+            request.reasoning.as_ref(),
+            &resolved.model,
+        )
+        .map_err(|error| provider_error_response(&error))?
+    } else {
+        None
+    };
     let provider = state.provider.clone();
     let responses_lite = request.responses_lite.value.clone();
 
@@ -3849,12 +3966,12 @@ async fn images_generations(
     .await
     .map_err(join_error_response)?;
 
-    let images = result.map_err(|error| provider_error_response(&error))?;
+    let images = result.map_err(|error| image_generation_error_response(&error))?;
 
     let mut data = Vec::with_capacity(images.len());
     for image in &images {
         let result_url = image.get("result").and_then(Value::as_str).ok_or_else(|| {
-            provider_error_response(&ProviderError::UpstreamProtocol(
+            image_generation_error_response(&ProviderError::UpstreamProtocol(
                 "image generation output requires a string result".to_string(),
             ))
         })?;
@@ -4152,12 +4269,7 @@ async fn compact(
     };
     let requested_model = optional_string_field(&body, "model").map_err(|error| respond(&error))?;
     let resolved = if force_anthropic {
-        let model = requested_model.as_deref().ok_or_else(|| {
-            respond(&ProviderError::InvalidRequest(
-                "model is required".to_string(),
-            ))
-        })?;
-        resolve_anthropic_route_model(&state, model)
+        resolve_anthropic_route_model(&state, requested_model, true, None)
             .await
             .map_err(|error| respond(&error))?
     } else {
@@ -4254,16 +4366,9 @@ async fn anthropic_count_tokens(
                 .into_response()
         })?;
     let input_tokens = estimate_input_tokens(&messages, tools.as_deref());
-    let request_model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| {
-            anthropic_provider_error_response(&ProviderError::InvalidRequest(
-                "model is required".to_string(),
-            ))
-        })?;
-    let resolved = resolve_anthropic_route_model(&state, request_model)
+    let request_model = optional_string_field(&body, "model")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
+    let resolved = resolve_anthropic_route_model(&state, request_model, false, None)
         .await
         .map_err(|error| anthropic_provider_error_response(&error))?;
     let context_window = context_window_for_model(&state, &resolved.model)
@@ -4286,7 +4391,12 @@ async fn anthropic_messages(
     headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<axum::response::Response, axum::response::Response> {
-    let body = anthropic_json(payload)?;
+    let mut body = anthropic_json(payload)?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("temperature");
+        obj.remove("top_p");
+        obj.remove("top_k");
+    }
     reject_unsupported_proxy_extension_presence(&body, true)
         .map_err(|error| anthropic_provider_error_response(&error))?;
     reject_explicit_null_anthropic_fields(&body)
@@ -4294,16 +4404,8 @@ async fn anthropic_messages(
     reject_unknown_top_level_fields(&body, ANTHROPIC_MESSAGE_FIELDS)
         .map_err(|error| anthropic_provider_error_response(&error))?;
     let request_id = format!("msg_{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
-    let client_model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| {
-            anthropic_provider_error_response(&ProviderError::InvalidRequest(
-                "model is required".to_string(),
-            ))
-        })?
-        .to_string();
+    let client_model = optional_string_field(&body, "model")
+        .map_err(|error| anthropic_provider_error_response(&error))?;
     let stream = match body.get("stream") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(value)) => *value,
@@ -4371,7 +4473,7 @@ async fn anthropic_messages(
         .map_err(|error| anthropic_provider_error_response(&error))?;
 
     let (messages, tools, tool_choice, stop, converted_reasoning_effort, text, parallel_tool_calls) =
-        anthropic_request_to_internal(&body).map_err(|message| {
+        anthropic_request_to_internal_for_model(&body, None).map_err(|message| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(format_anthropic_error(400, &message)),
@@ -4446,10 +4548,23 @@ async fn anthropic_messages(
     controls.reasoning_summary = thinking_controls.reasoning_summary.map(str::to_string);
     controls.allow_disabled_reasoning_fallback = thinking_controls.disabled && !has_explicit_effort;
 
-    let resolved = resolve_anthropic_route_model(&state, &client_model)
+    let resolved = resolve_anthropic_route_model(&state, client_model.clone(), false, Some(&body))
         .await
         .map_err(|error| anthropic_provider_error_response(&error))?;
     let backend_model = resolved.model.slug.clone();
+    let client_model = client_model.unwrap_or_else(|| backend_model.clone());
+    let usage_log =
+        env_nonempty("CODEX_AS_API_USAGE_LOG").or_else(|| env_nonempty("MAGI_USAGE_LOG"));
+    let key_src = if body
+        .get("prompt_cache_key")
+        .is_some_and(|value| !value.is_null())
+    {
+        "body"
+    } else if prompt_cache_key.is_some() {
+        "cc-session"
+    } else {
+        "none"
+    };
     let reasoning_effort = effective_reasoning_effort_with_fallback(
         &state,
         requested_reasoning_effort.as_deref(),
@@ -4471,6 +4586,7 @@ async fn anthropic_messages(
 
     if stream {
         let provider = state.provider.clone();
+        let log_cache_key = prompt_cache_key.clone();
 
         let prepared = task::spawn_blocking({
             let provider = provider.clone();
@@ -4547,11 +4663,19 @@ async fn anthropic_messages(
                 )?;
             }
 
+            let mut usage = None;
             provider.stream_prepared_chat(prepared, |event| {
                 let chunks = adapter
                     .push(&event)
                     .map_err(ProviderError::UpstreamProtocol)?;
                 for chunk in chunks {
+                    if usage_log.is_some() {
+                        if let Some(data) = chunk.strip_prefix("event: message_delta\ndata: ") {
+                            usage = serde_json::from_str::<Value>(data)
+                                .ok()
+                                .and_then(|mut delta| delta.get_mut("usage").map(Value::take));
+                        }
+                    }
                     send_sse_event_with_backpressure(
                         &worker_sender,
                         anthropic_sse_event(&chunk),
@@ -4560,7 +4684,18 @@ async fn anthropic_messages(
                     )?;
                 }
                 Ok(())
-            })
+            })?;
+            if let (Some(path), Some(usage)) = (usage_log.as_deref(), usage.as_ref()) {
+                append_anthropic_usage_log(
+                    path,
+                    &client_model,
+                    &backend_model_for_stream,
+                    usage,
+                    log_cache_key.as_deref(),
+                    key_src,
+                );
+            }
+            Ok(())
         });
 
         tokio::spawn(async move {
@@ -4602,6 +4737,7 @@ async fn anthropic_messages(
         Ok(Sse::new(event_stream).into_response())
     } else {
         let provider = state.provider.clone();
+        let log_cache_key = prompt_cache_key.clone();
         let result = task::spawn_blocking(move || {
             let tools_ref = tools.as_deref();
             let stop_ref = stop.as_deref();
@@ -4662,6 +4798,19 @@ async fn anthropic_messages(
         .map_err(|message| {
             anthropic_provider_error_response(&ProviderError::UpstreamProtocol(message))
         })?;
+        if let (Some(path), Some(usage)) = (usage_log, out.get("usage").cloned()) {
+            let _ = task::spawn_blocking(move || {
+                append_anthropic_usage_log(
+                    &path,
+                    &client_model,
+                    &backend_model,
+                    &usage,
+                    log_cache_key.as_deref(),
+                    key_src,
+                );
+            })
+            .await;
+        }
         Ok(Json(out).into_response())
     }
 }

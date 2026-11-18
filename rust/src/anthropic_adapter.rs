@@ -1,5 +1,5 @@
 use crate::messages::{AssistantResponse, Message, MessageRole, ToolCall, ToolSchema};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
 pub type AnthropicInternalRequest = (
@@ -94,6 +94,22 @@ pub fn anthropic_request_to_internal_for_model(
         match role {
             "user" => convert_user_message(content, &mut messages)?,
             "assistant" => convert_assistant_message(content, target_model, &mut messages)?,
+            "system" => {
+                let dev_text = extract_system_text(content)?;
+                if !dev_text.is_empty() {
+                    messages.push(Message {
+                        role: MessageRole::Developer,
+                        content: dev_text,
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                        reasoning_items: None,
+                        images: vec![],
+                        structured_content: None,
+                    });
+                }
+            }
             _ => return Err(format!("messages[{index}].role must be user or assistant")),
         }
     }
@@ -927,11 +943,12 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<ToolSchema>, String> {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err(format!("tools[{index}].strict must be a boolean")),
         };
-        let parameters = object
+        let raw_parameters = object
             .get("input_schema")
             .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| format!("tools[{index}].input_schema must be an object"))?;
+        let parameters = sanitize_tool_schema(raw_parameters);
         result.push(ToolSchema {
             name,
             description,
@@ -940,6 +957,34 @@ fn convert_tools(tools: &[Value]) -> Result<Vec<ToolSchema>, String> {
         });
     }
     Ok(result)
+}
+
+fn contains_unicode_property_escape(pattern: &str) -> bool {
+    pattern
+        .as_bytes()
+        .windows(3)
+        .any(|window| matches!(window, b"\\p{" | b"\\P{"))
+}
+
+fn sanitize_tool_schema(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_tool_schema).collect()),
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, v) in map {
+                if k == "pattern" {
+                    if let Value::String(ref s) = v {
+                        if contains_unicode_property_escape(s) {
+                            continue;
+                        }
+                    }
+                }
+                out.insert(k, sanitize_tool_schema(v));
+            }
+            Value::Object(out)
+        }
+        other => other,
+    }
 }
 
 fn validate_anthropic_tool_controls(tools: &[Value]) -> Result<(), String> {

@@ -14,6 +14,9 @@ REASONING_SIGNATURE_RECOGNIZED_PREFIX = "codex-reasoning"
 REASONING_SIGNATURE_VERSION = 1
 REASONING_COMPATIBLE_MODELS: frozenset[str] = frozenset(
     {
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
         "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-6-sol",

@@ -5,6 +5,9 @@ export const REASONING_SIGNATURE_PREFIX = "codex-reasoning-v1:";
 export const REASONING_SIGNATURE_VERSION = 1 as const;
 
 export const REASONING_COMPATIBLE_MODELS: ReadonlySet<string> = new Set([
+  "gpt-6.2-sol",
+  "gpt-6.2-astra",
+  "gpt-6.1-terra",
   "gpt-6.1-sol",
   "gpt-6-astra",
   "gpt-6-sol",

@@ -3198,7 +3198,8 @@ describe("Codex CLI request headers", () => {
 
     assert.equal(headers.originator, "codex_cli_rs");
     assert.ok(headers["User-Agent"].startsWith("codex_cli_rs/0.164.0 ("));
-    assert.ok(headers["User-Agent"].endsWith(") codex-as-api/1.0.0"));
+    const { version } = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    assert.ok(headers["User-Agent"].endsWith(`) codex-as-api/${version}`));
 
     const dynamicHeaders = codexCliHeadersForVersion("1.2.3");
     assert.equal(dynamicHeaders.originator, "codex_cli_rs");

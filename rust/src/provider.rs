@@ -895,6 +895,7 @@ pub struct ResolvedModel {
 #[derive(Clone, Copy)]
 enum ResponsesEndpointKind {
     Standard,
+    ImageGenerationWithoutReasoning,
     Compact,
 }
 
@@ -2161,7 +2162,12 @@ impl ChatGPTOAuthProvider {
             responses_lite,
             merged_text.as_ref(),
             None,
-            ResponsesEndpointKind::Standard,
+            if reasoning_effort.is_some() || controls.reasoning.is_some() {
+                ResponsesEndpointKind::Standard
+            } else {
+                // The backend treats implicit text-model effort as image complexity.
+                ResponsesEndpointKind::ImageGenerationWithoutReasoning
+            },
             controls.reasoning_summary.as_deref(),
             controls.allow_disabled_reasoning_fallback,
         )?;
@@ -3559,6 +3565,18 @@ fn image_generations_from_response_items(items: &[Value]) -> Result<Vec<Value>, 
     for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => validate_response_output_item(item)?,
+            // Empty assistant placeholders are harmless; other messages may contain refusals.
+            Some("message")
+                if item.get("role").and_then(Value::as_str) == Some("assistant")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().all(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("output_text")
+                                    && part.get("text").and_then(Value::as_str) == Some("")
+                            })
+                        }) => {}
             Some("image_generation_call") => {
                 if let Some(image) = image_generation_from_item(item)? {
                     generated.push(image);
@@ -4069,7 +4087,25 @@ fn validate_added_response_output_item(item: &Value) -> Result<(), ProviderError
             }
         }
         "image_generation_call" => {
-            image_generation_from_item(item)?;
+            if item.get("status").and_then(Value::as_str) == Some("completed") {
+                image_generation_from_item(item)?;
+            } else {
+                if !item.get("status").is_some_and(Value::is_string) {
+                    return Err(ProviderError::UpstreamProtocol(
+                        "image_generation_call requires a string status".to_string(),
+                    ));
+                }
+                for field in ["result", "revised_prompt"] {
+                    if item
+                        .get(field)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                    {
+                        return Err(ProviderError::UpstreamProtocol(format!(
+                            "image_generation_call {field} must be a string or null when added"
+                        )));
+                    }
+                }
+            }
         }
         _ => {
             return Err(ProviderError::UpstreamProtocol(
@@ -4659,11 +4695,16 @@ fn finalize_responses_request_with_reasoning_controls(
     payload_object.insert("model".to_string(), Value::String(model.slug.clone()));
     apply_model_capability_fields(payload_object, model, text, service_tier)
         .map_err(ProviderError::InvalidRequest)?;
-    if payload_object
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .is_none()
+    let omit_reasoning = matches!(
+        endpoint,
+        ResponsesEndpointKind::ImageGenerationWithoutReasoning
+    );
+    if !omit_reasoning
+        && payload_object
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|reasoning| reasoning.get("effort"))
+            .is_none()
     {
         if let Some(default_reasoning_level) = model.default_reasoning_level.as_deref() {
             set_reasoning_payload_with_options(
@@ -4707,7 +4748,7 @@ fn finalize_responses_request_with_reasoning_controls(
             && model.default_reasoning_summary != "none")
             .then_some(model.default_reasoning_summary.as_str()),
     };
-    if let Some(summary) = reasoning_summary {
+    if let Some(summary) = reasoning_summary.filter(|_| !omit_reasoning) {
         let reasoning = payload_object
             .entry("reasoning".to_string())
             .or_insert_with(|| json!({}))
@@ -4741,6 +4782,7 @@ fn finalize_responses_request_with_reasoning_controls(
         ResponsesEndpointKind::Compact => {
             payload_object.remove("include");
         }
+        ResponsesEndpointKind::ImageGenerationWithoutReasoning => {}
     }
 
     let lite = use_responses_lite(model, responses_lite).map_err(ProviderError::InvalidRequest)?;
@@ -4756,17 +4798,20 @@ fn finalize_responses_request_with_reasoning_controls(
             ));
         }
         match endpoint {
-            ResponsesEndpointKind::Standard => match payload_object.get("tool_choice") {
-                None => {
-                    payload_object.insert("tool_choice".to_string(), json!("auto"));
+            ResponsesEndpointKind::Standard
+            | ResponsesEndpointKind::ImageGenerationWithoutReasoning => {
+                match payload_object.get("tool_choice") {
+                    None => {
+                        payload_object.insert("tool_choice".to_string(), json!("auto"));
+                    }
+                    Some(Value::String(value)) if value == "auto" => {}
+                    Some(_) => {
+                        return Err(ProviderError::InvalidRequest(
+                            "Responses Lite tool_choice must be the exact string auto".to_string(),
+                        ));
+                    }
                 }
-                Some(Value::String(value)) if value == "auto" => {}
-                Some(_) => {
-                    return Err(ProviderError::InvalidRequest(
-                        "Responses Lite tool_choice must be the exact string auto".to_string(),
-                    ));
-                }
-            },
+            }
             ResponsesEndpointKind::Compact => {
                 payload_object.remove("tool_choice");
             }

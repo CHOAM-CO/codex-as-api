@@ -1078,12 +1078,16 @@ export class ChatGPTOAuthProvider {
       store: false,
       include: [],
     };
-    setReasoningPayload(
-      payload,
-      effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
-      opts.reasoning,
-      prepared.capability,
-    );
+    // An implicit text-model effort is interpreted upstream as image complexity.
+    const explicitReasoning = opts.reasoningEffort != null || opts.reasoning != null;
+    if (explicitReasoning) {
+      setReasoningPayload(
+        payload,
+        effectiveReasoningEffort(prepared.capability, opts.reasoningEffort, opts.reasoning),
+        opts.reasoning,
+        prepared.capability,
+      );
+    }
     rejectUnsupportedPrivateRequestFields(
       payload,
       opts.safetyIdentifier,
@@ -1092,6 +1096,7 @@ export class ChatGPTOAuthProvider {
     validatePromptCacheBreakpoints(payload);
     finalizeResponsesPayload(payload, {
       endpoint: "responses",
+      omitReasoning: !explicitReasoning,
       capability: prepared.capability,
       responsesLite: opts.responsesLite,
       text: opts.text,
@@ -1102,6 +1107,11 @@ export class ChatGPTOAuthProvider {
     for (const item of outputItems) {
       if (item.type === "reasoning") {
         reasoningFromResponseItems([item]);
+        continue;
+      }
+      // Empty assistant placeholders are harmless; keep rejecting text and refusals.
+      if (item.type === "message" && item.role === "assistant" && Array.isArray(item.content)
+        && item.content.every((part) => isRecordValue(part) && part.type === "output_text" && part.text === "")) {
         continue;
       }
       const image = imageGenerationFromItem(item);
@@ -2563,7 +2573,20 @@ function validateAddedResponseItem(item: Record<string, unknown>): void {
     return;
   }
   if (itemType === "image_generation_call") {
-    imageGenerationFromItem(item);
+    // Added items may not have a result until the image completes.
+    if (item.status === "completed") {
+      imageGenerationFromItem(item);
+    } else {
+      if (typeof item.status !== "string") {
+        throw new ChatGPTOAuthProtocolError("image_generation_call requires a string status");
+      }
+      if (item.result != null && typeof item.result !== "string") {
+        throw new ChatGPTOAuthProtocolError("image_generation_call result must be a string or null when added");
+      }
+      if (item.revised_prompt != null && typeof item.revised_prompt !== "string") {
+        throw new ChatGPTOAuthProtocolError("image_generation_call revised_prompt must be a string when provided");
+      }
+    }
     return;
   }
   throw new ChatGPTOAuthProtocolError(
@@ -3218,6 +3241,7 @@ function finalizeResponsesPayload(
     endpoint: "responses" | "compact";
     capability: ModelCapability;
     reasoningSummary?: ReasoningSummaryOption;
+    omitReasoning?: boolean;
     responsesLite?: boolean | string;
     serviceTier?: string;
     text?: Record<string, unknown>;
@@ -3241,7 +3265,7 @@ function finalizeResponsesPayload(
   }
   applyModelCapabilityFields(payload, opts.capability, opts.text, opts.serviceTier);
   let configuredSummary: string | undefined;
-  if (opts.capability.supportsReasoningSummaryParameter) {
+  if (!opts.omitReasoning && opts.capability.supportsReasoningSummaryParameter) {
     if (opts.reasoningSummary === "none") {
       configuredSummary = "none";
     } else if (
@@ -3266,7 +3290,7 @@ function finalizeResponsesPayload(
   } else if (isRecordValue(payload.reasoning)) {
     delete payload.reasoning.summary;
   }
-  if (opts.endpoint === "responses") {
+  if (opts.endpoint === "responses" && !opts.omitReasoning) {
     if (Object.hasOwn(payload, "include") && !Array.isArray(payload.include)) {
       throw new ChatGPTOAuthInvalidRequestError("include must be an array");
     }

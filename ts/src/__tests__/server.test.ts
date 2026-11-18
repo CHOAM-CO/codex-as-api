@@ -3397,6 +3397,93 @@ describe("Anthropic compatibility helper routes", () => {
     }, { model: "gpt-5.5" });
   });
 
+  it("gates Anthropic routing, ignores sampling hints, and appends final JSONL usage", async (t) => {
+    for (const name of [
+      "CODEX_AS_API_SUBAGENT_MODEL", "CODEX_AS_API_COMPACT_MODEL",
+      "CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL", "CODEX_AS_API_USAGE_LOG", "MAGI_USAGE_LOG",
+    ]) {
+      const saved = process.env[name];
+      delete process.env[name];
+      t.after(() => {
+        if (saved === undefined) delete process.env[name];
+        else process.env[name] = saved;
+      });
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-anthropic-usage-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const primaryLog = path.join(dir, "logs", "usage.jsonl");
+    const aliasLog = path.join(dir, "logs", "magi.jsonl");
+    const routed: string[] = [];
+    const provider = {
+      async chat(_messages: unknown, opts: Record<string, unknown>) {
+        routed.push(opts.model as string);
+        for (const field of ["temperature", "top_p", "top_k"]) {
+          assert.equal(Object.hasOwn(opts, field), false);
+        }
+        return {
+          content: "done", tool_calls: [], finish_reason: "stop",
+          usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14, cached_tokens: 2 },
+          reasoning_content: null, raw: null,
+        };
+      },
+      async *chatStream(_messages: unknown, opts: { model: string }) {
+        routed.push(opts.model);
+        yield { type: "finish", finish_reason: "stop", usage: {
+          input_tokens: 11, output_tokens: 3, total_tokens: 14, input_tokens_details: { cached_tokens: 2 },
+        } };
+      },
+      async compactMessages(_messages: unknown, opts: { model: string }) {
+        routed.push(opts.model);
+        return "checkpoint";
+      },
+    };
+    await withServer(provider, async (baseUrl) => {
+      const base = { max_tokens: 32, messages: [{ role: "user", content: "hello" }] };
+      const post = (suffix: string, extra: Record<string, unknown> = {}) => fetch(`${baseUrl}/v1/messages${suffix}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...base, ...extra }),
+      });
+      assert.equal((await post("")).status, 400);
+      assert.equal((await post("", { model: "unknown-model" })).status, 404);
+      process.env.CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL = " YeS ";
+      assert.equal((await (await post("")).json() as { model: string }).model, "gpt-5.5");
+      assert.equal((await post("", { model: "unknown-model" })).status, 200);
+      assert.equal((await post("/count_tokens")).status, 200);
+      assert.equal((await post("/compact")).status, 200);
+
+      process.env.CODEX_AS_API_SUBAGENT_MODEL = "gpt-5.6-terra";
+      process.env.CODEX_AS_API_COMPACT_MODEL = "gpt-5.6-sol";
+      const claude = { model: "claude-test" };
+      assert.deepEqual(await (await post("/compact", claude)).json(), { checkpoint: "checkpoint" });
+      const summary = await post("", { ...claude, messages: [{ role: "user", content: [
+        { type: "text", text: "Create a detailed summary of the conversation so far." },
+      ] }] });
+      assert.equal(summary.status, 200, await summary.text());
+
+      process.env.CODEX_AS_API_USAGE_LOG = primaryLog;
+      process.env.MAGI_USAGE_LOG = aliasLog;
+      const response = await post("", { ...claude, temperature: 0.4, top_p: 0.8, top_k: 10, prompt_cache_key: "explicit" });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal((await response.json() as { model: string }).model, "claude-test");
+      assert.equal(fs.existsSync(aliasLog), false);
+      delete process.env.CODEX_AS_API_USAGE_LOG;
+      const stream = await post("", { ...claude, stream: true });
+      assert.match(await stream.text(), /event: message_stop/);
+    });
+    assert.deepEqual(routed, ["gpt-5.5", "gpt-5.5", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-terra"]);
+    for (const [logPath, key, source] of [[primaryLog, "explicit", "body"], [aliasLog, null, "none"]] as const) {
+      const rows = fs.readFileSync(logPath, "utf8").trimEnd().split("\n");
+      assert.equal(rows.length, 1);
+      const { ts, port, ...row } = JSON.parse(rows[0]);
+      assert.match(ts, /^\d{4}-\d{2}-\d{2}T/);
+      assert.equal(typeof port, "string");
+      assert.deepEqual(row, {
+        model: "claude-test", backend_model: "gpt-5.6-terra", input_tokens: 9, output_tokens: 3,
+        cache_read_input_tokens: 2, cache_creation_input_tokens: 0, key, key_src: source,
+      });
+    }
+  });
+
   it("accepts direct live catalog slugs on every Anthropic-compatible route", async () => {
     const routedModels: string[] = [];
     const provider = {

@@ -5,10 +5,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
@@ -311,20 +313,109 @@ def _anthropic_output_format_from_body(body: dict[str, Any]) -> dict[str, Any] |
     return cast(dict[str, Any], output_format)
 
 
+def _is_unknown_model_fallback_enabled() -> bool:
+    raw = (os.getenv("CODEX_AS_API_FALLBACK_ON_UNKNOWN_MODEL") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_anthropic_auto_compact_body(body: dict[str, Any] | None) -> bool:
+    if not isinstance(body, dict):
+        return False
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return False
+    last = msgs[-1]
+    if not isinstance(last, dict):
+        return False
+    text = json.dumps(last.get("content", ""), ensure_ascii=False)
+    return "create a detailed summary of the conversation so far" in text.lower()
+
+
+def _anthropic_compact_model(*, is_compact: bool = False, raw_body: dict[str, Any] | None = None) -> str:
+    override = (os.getenv("CODEX_AS_API_COMPACT_MODEL") or "").strip()
+    return override if override and (is_compact or _is_anthropic_auto_compact_body(raw_body)) else ""
+
+
+def _append_anthropic_usage_log(
+    *,
+    model: str,
+    backend_model: str,
+    usage: Mapping[str, Any] | None,
+    prompt_cache_key: str | None,
+    key_src: str,
+) -> None:
+    log_path = (os.getenv("CODEX_AS_API_USAGE_LOG") or "").strip() or (os.getenv("MAGI_USAGE_LOG") or "").strip()
+    if not log_path or not isinstance(usage, Mapping):
+        return
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "port": str(os.getenv("CODEX_AS_API_PORT") or 18080),
+        "model": model,
+        "backend_model": backend_model,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "cache_read_input_tokens": usage.get("cache_read_input_tokens") or 0,
+        "cache_creation_input_tokens": usage.get("cache_creation_input_tokens") or 0,
+        "key": prompt_cache_key,
+        "key_src": key_src,
+    }
+    try:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(log_path).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 def _anthropic_backend_model(
     provider: ChatGPTOAuthProvider,
     client_model: object,
     *,
     snapshot: ModelCatalogSnapshot | None = None,
+    is_compact: bool = False,
+    raw_body: dict[str, Any] | None = None,
 ) -> tuple[ModelCatalogSnapshot, ModelCapability]:
-    if client_model is not None and not isinstance(client_model, str):
-        raise ChatGPTOAuthInvalidRequestError("model must be a string")
-    return provider.resolve_model(
-        cast(str | None, client_model),
-        anthropic_facade=True,
-        snapshot=snapshot,
-    )
-
+    if client_model is not None and (
+        not isinstance(client_model, str) or not client_model or client_model != client_model.strip()
+    ):
+        raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string without surrounding whitespace")
+    compact_override = _anthropic_compact_model(is_compact=is_compact, raw_body=raw_body)
+    if compact_override:
+        return provider.resolve_model(
+            compact_override,
+            anthropic_facade=False,
+            snapshot=snapshot,
+        )
+    if client_model is None:
+        if not _is_unknown_model_fallback_enabled():
+            raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string")
+        return provider.resolve_model(
+            None,
+            anthropic_facade=False,
+            snapshot=snapshot,
+        )
+    if isinstance(client_model, str) and client_model.startswith("claude-"):
+        subagent_override = (os.getenv("CODEX_AS_API_SUBAGENT_MODEL") or "").strip()
+        if subagent_override:
+            return provider.resolve_model(
+                subagent_override,
+                anthropic_facade=False,
+                snapshot=snapshot,
+            )
+    try:
+        return provider.resolve_model(
+            cast(str | None, client_model),
+            anthropic_facade=True,
+            snapshot=snapshot,
+        )
+    except ChatGPTOAuthModelNotFoundError:
+        if _is_unknown_model_fallback_enabled():
+            return provider.resolve_model(
+                None,
+                anthropic_facade=False,
+                snapshot=snapshot,
+            )
+        raise
 
 def _validate_anthropic_context_management(value: object) -> None:
     if value is None:
@@ -532,7 +623,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="1.0.0",
+    version="1.0.1",
 )
 
 
@@ -778,11 +869,15 @@ async def _chatgpt_oauth_error_handler(request: Request, exc: ChatGPTOAuthError)
             content=format_anthropic_error(status, _public_error_message(exc)),
         )
     error_type = _error_type(exc)
+    message = _public_error_message(exc)
+    if request.url.path == "/v1/images/generations" and isinstance(exc, ChatGPTOAuthProtocolError):
+        detail = re.sub(r"[A-Za-z0-9_-]{32,}", "[redacted]", str(exc))[:500]
+        message = f"{message}: {detail}"
     return JSONResponse(
         status_code=status,
         content={
             "error": {
-                "message": _public_error_message(exc),
+                "message": message,
                 "type": error_type,
                 "code": error_type,
             }
@@ -1720,8 +1815,6 @@ def _messages_from_compact_body(
         _validate_anthropic_context_management(body.get("context_management"))
         _validate_anthropic_sampling_hints(body)
         anthropic_model = body.get("model")
-        if not isinstance(anthropic_model, str) or not anthropic_model:
-            raise ChatGPTOAuthInvalidRequestError("model must be a non-empty string")
         anthropic_messages = cast(list[dict[str, Any]], messages_value)
         max_tokens = _positive_integer_field(body, "max_tokens", required=False)
         raw_tools = body.get("tools")
@@ -1737,6 +1830,9 @@ def _messages_from_compact_body(
         try:
             messages, tools, _converted_tool_choice, _stop, reasoning_effort, text = anthropic_request_to_internal(
                 model=anthropic_model,
+                allow_missing_model=anthropic and (
+                    _is_unknown_model_fallback_enabled() or bool(_anthropic_compact_model(is_compact=True))
+                ),
                 messages=anthropic_messages,
                 system=body.get("system"),
                 tools=raw_tools,
@@ -2432,6 +2528,7 @@ async def anthropic_count_tokens(http_request: Request) -> JSONResponse:
         _validate_anthropic_sampling_hints(body)
         messages, tools, _tool_choice, _stop, _reasoning_effort, _text = anthropic_request_to_internal(
             model=body.get("model"),
+            allow_missing_model=_is_unknown_model_fallback_enabled(),
             messages=body.get("messages"),
             system=body.get("system"),
             tools=body.get("tools"),
@@ -2474,6 +2571,8 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     provider = _get_provider()
     try:
         body = await _request_json_object(http_request)
+        for _sampling_key in ("temperature", "top_p", "top_k"):
+            body.pop(_sampling_key, None)
         _reject_explicit_null_responses_lite(body)
         _reject_unknown_fields(body, _ANTHROPIC_MESSAGES_FIELDS)
         _reject_explicit_null_anthropic_fields(body)
@@ -2532,8 +2631,10 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
         )
         _validate_anthropic_context_management(body.get("context_management"))
         raw_thinking = body.get("thinking")
+        client_model = body.get("model")
         messages, tools, tool_choice, stop, reasoning_effort, text = anthropic_request_to_internal(
-            model=body.get("model"),
+            model=client_model,
+            allow_missing_model=_is_unknown_model_fallback_enabled() or bool(_anthropic_compact_model(raw_body=body)),
             messages=body.get("messages"),
             system=body.get("system"),
             tools=body.get("tools"),
@@ -2560,12 +2661,6 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             content=format_anthropic_error(400, "stream must be a boolean"),
         )
     responses_lite = body.get("responses_lite")
-    client_model = body.get("model")
-    if not isinstance(client_model, str) or not client_model:
-        return JSONResponse(
-            status_code=400,
-            content=format_anthropic_error(400, "model must be a non-empty string"),
-        )
     try:
         explicit_effort = body.get("reasoning_effort")
         if explicit_effort is not None and (not isinstance(explicit_effort, str) or not explicit_effort):
@@ -2589,6 +2684,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             _anthropic_backend_model,
             provider,
             client_model,
+            raw_body=body,
         )
     except ChatGPTOAuthError as exc:
         status = _error_status(exc)
@@ -2640,12 +2736,18 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
 
     suppress_thinking_output = thinking_disabled or effective_reasoning_effort in {"none", "disabled"}
 
+    display_client_model = client_model if isinstance(client_model, str) and client_model else request_model
+    key_src = (
+        "body"
+        if body.get("prompt_cache_key") is not None
+        else ("cc-session" if claude_session_id is not None else "none")
+    )
     if stream:
 
         def _stream() -> Iterator[str]:
             request_id = f"msg_{uuid.uuid4().hex[:24]}"
             try:
-                yield from anthropic_stream_adapter(
+                for chunk in anthropic_stream_adapter(
                     provider.chat_stream(
                         messages,
                         model=request_model,
@@ -2670,12 +2772,28 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
                         service_tier=service_tier,
                         _prepared_request=prepared_request,
                     ),
-                    model=client_model,
+                    model=display_client_model,
                     request_id=request_id,
                     thinking_display=thinking_display,
                     backend_model=request_model,
                     thinking_disabled=suppress_thinking_output,
-                )
+                ):
+                    if chunk.startswith("event: message_delta\n"):
+                        for line in chunk.splitlines():
+                            if line.startswith("data: "):
+                                try:
+                                    payload_obj = json.loads(line[6:])
+                                    if isinstance(payload_obj, dict):
+                                        _append_anthropic_usage_log(
+                                            model=display_client_model,
+                                            backend_model=request_model,
+                                            usage=payload_obj.get("usage"),
+                                            prompt_cache_key=prompt_cache_key,
+                                            key_src=key_src,
+                                        )
+                                except ValueError:
+                                    pass
+                    yield chunk
             except Exception as exc:  # noqa: BLE001 - serialize runtime stream failures in-band
                 status = _error_status(exc) if isinstance(exc, ChatGPTOAuthError) else 500
                 error = format_anthropic_error(status, _public_error_message(exc))
@@ -2728,7 +2846,7 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
     try:
         result = internal_response_to_anthropic(
             response,
-            client_model,
+            display_client_model,
             request_id,
             thinking_display=thinking_display,
             backend_model=request_model,
@@ -2740,6 +2858,13 @@ async def anthropic_messages(http_request: Request) -> JSONResponse | StreamingR
             status_code=status,
             content=format_anthropic_error(status, _public_error_message(exc)),
         )
+    _append_anthropic_usage_log(
+        model=display_client_model,
+        backend_model=request_model,
+        usage=result.get("usage") if isinstance(result, dict) else None,
+        prompt_cache_key=prompt_cache_key,
+        key_src=key_src,
+    )
     return JSONResponse(
         content=result,
     )
@@ -2871,6 +2996,8 @@ async def compact(request: Request) -> JSONResponse:
             _anthropic_backend_model,
             provider,
             requested_model,
+            is_compact=True,
+            raw_body=body,
         )
     else:
         resolved_model = await run_in_threadpool(

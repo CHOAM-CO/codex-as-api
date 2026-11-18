@@ -2277,6 +2277,14 @@ def _image_generations_from_response_items(items: Sequence[dict[str, Any]]) -> l
         if item_type == "reasoning":
             _validate_response_output_item(item)
             continue
+        if item_type == "message" and item.get("role") == "assistant":
+            parts = item.get("content")
+            if isinstance(parts, list) and all(
+                isinstance(part, dict) and part.get("type") == "output_text" and part.get("text") == ""
+                for part in parts
+            ):
+                # Empty assistant placeholders are harmless; other messages may contain refusals.
+                continue
         if item_type != "image_generation_call":
             raise ChatGPTOAuthProtocolError("image generation response contains an unsupported output item")
         image = _image_generation_from_item(item)
@@ -2460,7 +2468,15 @@ def _validate_added_response_output_item(item: dict[str, Any]) -> None:
             )
         return
     if item_type == "image_generation_call":
-        _image_generation_from_item(item)
+        if item.get("status") == "completed":
+            _image_generation_from_item(item)
+        else:
+            if not isinstance(item.get("status"), str):
+                raise ChatGPTOAuthProtocolError("image_generation_call requires a string status")
+            if item.get("result") is not None and not isinstance(item["result"], str):
+                raise ChatGPTOAuthProtocolError("image_generation_call result must be a string or null when added")
+            if item.get("revised_prompt") is not None and not isinstance(item["revised_prompt"], str):
+                raise ChatGPTOAuthProtocolError("image_generation_call revised_prompt must be a string when provided")
         return
     raise ChatGPTOAuthProtocolError("response.output_item.added item has an unsupported type")
 

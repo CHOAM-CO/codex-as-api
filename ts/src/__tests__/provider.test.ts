@@ -2270,7 +2270,6 @@ describe("Responses stream completion", () => {
       { type: "response.audio.transcript.done" },
       { type: "response.refusal.delta" },
       { type: "response.refusal.done" },
-      { type: "response.output_text.annotation.added" },
       { type: "response.custom_tool_call_input.delta", delta: "{}", call_id: "call-1" },
       { type: "response.custom_tool_call_input.done", input: "{}", call_id: "call-1" },
       { type: "response.output_text.delta", delta: null },
@@ -2363,6 +2362,10 @@ describe("Responses stream completion", () => {
     }).postSSE = async function* () {
       yield { type: "", opaque: "ignored" };
       yield { type: "response.future_telemetry", opaque: true };
+      yield {
+        type: "response.output_text.annotation.added",
+        annotation: { type: "url_citation", url: "https://example.com", title: "Example" },
+      };
       yield {
         type: "response.content_part.added",
         part: { type: "output_text", text: "", annotations: [], logprobs: [] },
@@ -3955,6 +3958,27 @@ describe("webSearchEventFromResponseItem", () => {
         title: "Duplicate",
         page_age: "",
       },
+    ]);
+  });
+
+  it("skips web_search sources without a usable url instead of failing", () => {
+    const result = webSearchEventFromResponseItem({
+      type: "web_search_call",
+      id: "ws_urlless",
+      action: {
+        type: "search",
+        query: "weather",
+        sources: [
+          { title: "Built-in weather data" },
+          { url: "", title: "Empty" },
+          { url: null },
+          { url: "https://example.com", title: "Example" },
+        ],
+      },
+    });
+    assert.ok(result);
+    assert.deepEqual(result.content, [
+      { type: "web_search_result", url: "https://example.com", title: "Example" },
     ]);
   });
 

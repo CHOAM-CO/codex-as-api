@@ -119,6 +119,11 @@ const RESPONSE_EVENT_TYPES = new Set([
   "response.completed",
   "responsesapi.websocket_timing",
 ]);
+// Event types we refuse rather than silently drop, because ignoring them would
+// lose model output. Purely informational events (e.g.
+// response.output_text.annotation.added, whose citations are already carried by
+// the final message) must NOT be listed here: they fall through to the
+// unknown-event path and are ignored.
 const UNSUPPORTED_RESPONSE_EVENT_TYPES = new Set([
   "response.file_search_call.in_progress",
   "response.file_search_call.searching",
@@ -147,7 +152,6 @@ const UNSUPPORTED_RESPONSE_EVENT_TYPES = new Set([
   "response.audio.transcript.done",
   "response.refusal.delta",
   "response.refusal.done",
-  "response.output_text.annotation.added",
   "response.custom_tool_call_input.delta",
   "response.custom_tool_call_input.done",
 ]);
@@ -3956,8 +3960,11 @@ function normalizeWebSearchSources(value: unknown): Record<string, unknown>[] {
       throw new ChatGPTOAuthProtocolError(`web_search source ${index} must be an object`);
     }
     const s = source as Record<string, unknown>;
+    // Upstream can emit sources without a url (e.g. built-in data providers
+    // backing a hosted web_search). Skip those rather than failing the whole
+    // response; Anthropic web_search_result blocks require a url.
     if (typeof s.url !== "string" || s.url.length === 0) {
-      throw new ChatGPTOAuthProtocolError(`web_search source ${index} requires a non-empty url`);
+      continue;
     }
     if (s.title != null && typeof s.title !== "string") {
       throw new ChatGPTOAuthProtocolError(`web_search source ${index} title must be a string when provided`);

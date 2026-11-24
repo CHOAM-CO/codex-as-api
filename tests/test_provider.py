@@ -1783,7 +1783,6 @@ def test_added_response_item_applies_common_optional_field_validation():
         "response.audio.transcript.done",
         "response.refusal.delta",
         "response.refusal.done",
-        "response.output_text.annotation.added",
         "response.custom_tool_call_input.delta",
         "response.custom_tool_call_input.done",
     ],
@@ -1792,6 +1791,17 @@ def test_known_unsupported_semantic_event_types_fail_immediately(event_type):
     with pytest.raises(ChatGPTOAuthProtocolError) as caught:
         _validate_response_event({"type": event_type})
     assert "unsupported semantic type" in str(caught.value)
+
+
+def test_output_text_annotation_added_is_ignored():
+    # url_citation annotations are informational: the citations are already
+    # carried by the final message, so the event must be ignored rather than
+    # failing the whole response.
+    event = {
+        "type": "response.output_text.annotation.added",
+        "annotation": {"type": "url_citation", "url": "https://example.com"},
+    }
+    assert _validate_response_event(event) == event
 
 
 @pytest.mark.parametrize(
@@ -4049,6 +4059,29 @@ def test_tool_schema_to_response_dict_web_search():
         "external_web_access": True,
         "filters": {"allowed_domains": ["example.com"]},
     }
+
+
+def test_web_search_event_skips_sources_without_a_usable_url():
+    result = _web_search_event_from_response_item(
+        {
+            "type": "web_search_call",
+            "id": "ws_urlless",
+            "action": {
+                "type": "search",
+                "query": "weather",
+                "sources": [
+                    {"title": "Built-in weather data"},
+                    {"url": ""},
+                    {"url": None},
+                    {"url": "https://example.com", "title": "Example"},
+                ],
+            },
+        }
+    )
+    assert result is not None
+    assert result["content"] == [
+        {"type": "web_search_result", "url": "https://example.com", "title": "Example"},
+    ]
 
 
 def test_web_search_event_from_response_item_action_sources():

@@ -623,7 +623,7 @@ def _health_error_message(exc: BaseException) -> str:
 app = FastAPI(
     title="codex-as-api",
     description="Local OpenAI-compatible API server backed by ChatGPT/Codex OAuth.",
-    version="1.0.1",
+    version="1.0.2",
 )
 
 

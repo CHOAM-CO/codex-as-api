@@ -534,7 +534,6 @@ mod live_catalog_tests {
             "response.audio.transcript.done",
             "response.refusal.delta",
             "response.refusal.done",
-            "response.output_text.annotation.added",
             "response.custom_tool_call_input.delta",
             "response.custom_tool_call_input.done",
         ] {
@@ -617,6 +616,44 @@ mod live_catalog_tests {
         .unwrap();
         assert_eq!(event["id"], "raw-web.id-1");
         assert_eq!(event["input"]["query"], "live query");
+    }
+
+    #[test]
+    fn web_search_event_skips_sources_without_a_usable_url() {
+        let event = web_search_event_from_response_item(&json!({
+            "type": "web_search_call",
+            "id": "raw-web.urlless",
+            "action": {
+                "type": "search",
+                "query": "weather",
+                "sources": [
+                    {"title": "Built-in weather data"},
+                    {"url": ""},
+                    {"url": null},
+                    {"url": "https://example.test", "title": "Example"}
+                ]
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        let content = event["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["url"], "https://example.test");
+        assert_eq!(content[0]["title"], "Example");
+    }
+
+    #[test]
+    fn output_text_annotation_added_is_ignored() {
+        // url_citation annotations are informational: the citations already ride
+        // along on the final message, so the event must not abort the response.
+        assert!(!is_unsupported_response_event_type(
+            "response.output_text.annotation.added"
+        ));
+        assert!(validate_response_event(&json!({
+            "type": "response.output_text.annotation.added",
+            "annotation": {"type": "url_citation", "url": "https://example.test"}
+        }))
+        .is_ok());
     }
 
     #[test]
@@ -3770,7 +3807,6 @@ fn is_unsupported_response_event_type(event_type: &str) -> bool {
             | "response.audio.transcript.done"
             | "response.refusal.delta"
             | "response.refusal.done"
-            | "response.output_text.annotation.added"
             | "response.custom_tool_call_input.delta"
             | "response.custom_tool_call_input.done"
     )
@@ -6095,15 +6131,16 @@ fn normalize_web_search_sources(value: &Value) -> Result<Vec<Value>, ProviderErr
         let object = source.as_object().ok_or_else(|| {
             ProviderError::UpstreamProtocol(format!("web search source {index} must be an object"))
         })?;
-        let url = object
+        // Upstream can emit sources without a url (e.g. built-in data providers
+        // backing a hosted web_search). Skip those rather than failing the whole
+        // response; Anthropic web_search_result blocks require a url.
+        let Some(url) = object
             .get("url")
             .and_then(Value::as_str)
             .filter(|url| !url.is_empty())
-            .ok_or_else(|| {
-                ProviderError::UpstreamProtocol(format!(
-                    "web search source {index} requires a non-empty url"
-                ))
-            })?;
+        else {
+            continue;
+        };
         let mut result = serde_json::Map::new();
         result.insert("type".to_string(), json!("web_search_result"));
         result.insert("url".to_string(), json!(url));

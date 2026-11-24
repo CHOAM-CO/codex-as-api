@@ -1,5 +1,19 @@
 # Release Notes
 
+## v1.0.2
+
+### Hosted web_search no longer fails the whole response
+
+- Skip upstream `web_search_call` sources that carry no usable `url` (e.g. OpenAI built-in
+  data providers) instead of raising a protocol error that failed the entire request with
+  HTTP 502. Anthropic `web_search_result` blocks require a url, so url-less sources are
+  dropped from the projected content and the remaining sources are preserved.
+- Stop treating `response.output_text.annotation.added` as an unsupported semantic event.
+  The `url_citation` annotations it carries are informational and are already present in
+  the final message, so the event is now ignored like any other unknown event rather than
+  aborting the stream the first time the model cites a search result.
+- Fixed in Python, TypeScript, and Rust.
+
 ## v1.0.1
 
 ### GPT-6.2 reasoning replay and Anthropic/Claude Code compatibility

@@ -150,7 +150,6 @@ _UNSUPPORTED_RESPONSE_EVENT_TYPES = frozenset(
         "response.audio.transcript.done",
         "response.refusal.delta",
         "response.refusal.done",
-        "response.output_text.annotation.added",
         "response.custom_tool_call_input.delta",
         "response.custom_tool_call_input.done",
     }
@@ -3626,8 +3625,11 @@ def _normalize_web_search_sources(value: Any) -> list[dict[str, Any]]:
         if not isinstance(source, dict):
             raise ChatGPTOAuthProtocolError(f"web search source {index} must be an object")
         url = source.get("url")
+        # Upstream can emit sources without a url (e.g. built-in data providers
+        # backing a hosted web_search). Skip those rather than failing the whole
+        # response; Anthropic web_search_result blocks require a url.
         if not isinstance(url, str) or not url:
-            raise ChatGPTOAuthProtocolError(f"web search source {index} requires a non-empty url")
+            continue
         title = source.get("title")
         if title is not None and not isinstance(title, str):
             raise ChatGPTOAuthProtocolError(f"web search source {index} title must be a string or null")

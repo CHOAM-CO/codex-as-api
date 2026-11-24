@@ -4084,6 +4084,22 @@ def test_web_search_event_skips_sources_without_a_usable_url():
     ]
 
 
+@pytest.mark.parametrize("bad_url", [123, True, {}, ["https://example.com"]])
+def test_web_search_event_rejects_non_string_source_url(bad_url):
+    with pytest.raises(ChatGPTOAuthProtocolError):
+        _web_search_event_from_response_item(
+            {
+                "type": "web_search_call",
+                "id": "ws_bad_url",
+                "action": {
+                    "type": "search",
+                    "query": "weather",
+                    "sources": [{"url": bad_url}],
+                },
+            }
+        )
+
+
 def test_web_search_event_from_response_item_action_sources():
     result = _web_search_event_from_response_item(
         {
@@ -5121,3 +5137,38 @@ def test_compact_responses_retains_all_items_and_completed_output_fallback_chain
     )
     assert len(compacted["output"]) == 4
     assert seen_payloads[-1]["reasoning"]["summary"] == "concise"
+
+
+def test_create_responses_stream_ignores_annotation_added_and_unknown_events(monkeypatch):
+    provider = ChatGPTOAuthProvider()
+    events = [
+        {"type": "", "opaque": "ignored"},
+        {"type": "response.future_telemetry", "opaque": True},
+        {
+            "type": "response.output_text.annotation.added",
+            "annotation": {"type": "url_citation", "url": "https://example.com", "title": "Example"},
+        },
+        {"type": "response.output_text.delta", "delta": "hello"},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_parity",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    }
+                ],
+            },
+        },
+    ]
+    monkeypatch.setattr(provider, "_post_sse", lambda *_args, **_kwargs: iter(events))
+
+    emitted = list(provider.create_responses_stream(model="gpt-5.5", input="hi"))
+    assert [event["type"] for event in emitted] == [
+        "response.output_text.delta",
+        "response.completed",
+    ]

@@ -1544,6 +1544,8 @@ class ChatGPTOAuthProvider:
         ):
             _validate_response_event(event)
             typ = event.get("type")
+            if typ not in _RESPONSE_EVENT_TYPES:
+                continue
             if typ == "response.output_item.done":
                 item = event.get("item")
                 if not isinstance(item, dict):
@@ -3628,8 +3630,10 @@ def _normalize_web_search_sources(value: Any) -> list[dict[str, Any]]:
         # Upstream can emit sources without a url (e.g. built-in data providers
         # backing a hosted web_search). Skip those rather than failing the whole
         # response; Anthropic web_search_result blocks require a url.
-        if not isinstance(url, str) or not url:
+        if url is None or url == "":
             continue
+        if not isinstance(url, str):
+            raise ChatGPTOAuthProtocolError(f"web search source {index} url must be a string or null")
         title = source.get("title")
         if title is not None and not isinstance(title, str):
             raise ChatGPTOAuthProtocolError(f"web search source {index} title must be a string or null")

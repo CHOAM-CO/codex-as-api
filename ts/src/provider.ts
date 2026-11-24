@@ -3963,9 +3963,12 @@ function normalizeWebSearchSources(value: unknown): Record<string, unknown>[] {
     // Upstream can emit sources without a url (e.g. built-in data providers
     // backing a hosted web_search). Skip those rather than failing the whole
     // response; Anthropic web_search_result blocks require a url.
-    if (typeof s.url !== "string" || s.url.length === 0) {
-      continue;
-    }
+if (s.url == null || s.url === "") {
+continue;
+}
+if (typeof s.url !== "string") {
+throw new ChatGPTOAuthProtocolError(`web_search source ${index} url must be a string when provided`);
+}
     if (s.title != null && typeof s.title !== "string") {
       throw new ChatGPTOAuthProtocolError(`web_search source ${index} title must be a string when provided`);
     }

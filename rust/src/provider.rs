@@ -643,6 +643,29 @@ mod live_catalog_tests {
     }
 
     #[test]
+    fn web_search_event_rejects_non_string_source_url() {
+        for bad_url in [
+            json!(123),
+            json!(true),
+            json!({}),
+            json!(["https://example.test"]),
+        ] {
+            assert!(matches!(
+                web_search_event_from_response_item(&json!({
+                    "type": "web_search_call",
+                    "id": "raw-web.bad-url",
+                    "action": {
+                        "type": "search",
+                        "query": "weather",
+                        "sources": [{"url": bad_url}]
+                    }
+                })),
+                Err(ProviderError::UpstreamProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
     fn output_text_annotation_added_is_ignored() {
         // url_citation annotations are informational: the citations already ride
         // along on the final message, so the event must not abort the response.
@@ -654,6 +677,16 @@ mod live_catalog_tests {
             "annotation": {"type": "url_citation", "url": "https://example.test"}
         }))
         .is_ok());
+        let mut block = vec![
+            "data: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://example.test\"}}".to_string(),
+        ];
+        let mut delivered = 0;
+        assert!(!emit_sse_block(&mut block, &[], &mut |_event| {
+            delivered += 1;
+            Ok(())
+        })
+        .unwrap());
+        assert_eq!(delivered, 0);
     }
 
     #[test]
@@ -6134,12 +6167,15 @@ fn normalize_web_search_sources(value: &Value) -> Result<Vec<Value>, ProviderErr
         // Upstream can emit sources without a url (e.g. built-in data providers
         // backing a hosted web_search). Skip those rather than failing the whole
         // response; Anthropic web_search_result blocks require a url.
-        let Some(url) = object
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-        else {
-            continue;
+        let url = match object.get("url") {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(url)) if url.is_empty() => continue,
+            Some(Value::String(url)) => url.as_str(),
+            Some(_) => {
+                return Err(ProviderError::UpstreamProtocol(format!(
+                    "web search source {index} url must be a string"
+                )));
+            }
         };
         let mut result = serde_json::Map::new();
         result.insert("type".to_string(), json!("web_search_result"));

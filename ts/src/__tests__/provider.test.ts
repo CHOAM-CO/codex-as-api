@@ -3996,6 +3996,10 @@ describe("webSearchEventFromResponseItem", () => {
       { type: "find_in_page", pattern: "needle", url: 123 },
       { type: "future", sources: [] },
       { type: "search", query: "hello", sources: [{ url: "https://example.com", page_age: 1 }] },
+      { type: "search", query: "hello", sources: [{ url: 123 }] },
+      { type: "search", query: "hello", sources: [{ url: true }] },
+      { type: "search", query: "hello", sources: [{ url: {} }] },
+      { type: "search", query: "hello", sources: [{ url: ["https://example.com"] }] },
     ]) {
       assert.throws(
         () => webSearchEventFromResponseItem({
@@ -5195,5 +5199,42 @@ describe("Native /v1/responses parity", () => {
     assert.equal((compacted.reasoning as Record<string, unknown> | undefined)?.summary, undefined);
     assert.equal((seenPayloads.at(-1)?.reasoning as Record<string, unknown>)?.summary, "concise");
     assert.equal((compacted.output as unknown[]).length, 4);
+  });
+
+  it("ignores annotation.added and unknown upstream events in native responses streams", async () => {
+    const provider = testProvider();
+    (provider as unknown as {
+      postSSE(path: string, payload: Record<string, unknown>): AsyncGenerator<Record<string, unknown>>;
+    }).postSSE = async function* () {
+      yield { type: "", opaque: "ignored" };
+      yield { type: "response.future_telemetry", opaque: true };
+      yield {
+        type: "response.output_text.annotation.added",
+        annotation: { type: "url_citation", url: "https://example.com", title: "Example" },
+      };
+      yield { type: "response.output_text.delta", delta: "hello" };
+      yield {
+        type: "response.completed",
+        response: {
+          id: "resp_stream_parity",
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "hello" }],
+          }],
+        },
+      };
+    };
+
+    const emitted: Record<string, unknown>[] = [];
+    for await (const event of await provider.createResponsesStream({ model: "gpt-5.5", input: "hi" })) {
+      emitted.push(event);
+    }
+    assert.deepEqual(
+      emitted.map((event) => event.type),
+      ["response.output_text.delta", "response.completed"],
+    );
   });
 });

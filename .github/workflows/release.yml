@@ -69,6 +69,7 @@ jobs:
             dist/codex_as_api-*.whl
             dist/codex_as_api-*.tar.gz
           if-no-files-found: error
+          retention-days: 14
 
   typescript:
     name: Test and package TypeScript
@@ -127,11 +128,13 @@ jobs:
           name: npm-tarball
           path: dist/npm/codex-as-api-*.tgz
           if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: github-packages-tarball
           path: dist/github/choam-co-codex-as-api-*.tgz
           if-no-files-found: error
+          retention-days: 14
 
   rust:
     name: Build Rust (${{ matrix.platform }})
@@ -202,6 +205,7 @@ jobs:
           name: rust-${{ matrix.platform }}-archive
           path: dist/rust/codex-as-api-*-${{ matrix.platform }}.zip
           if-no-files-found: error
+          retention-days: 14
 
   publish-pypi:
     name: Publish Python to PyPI

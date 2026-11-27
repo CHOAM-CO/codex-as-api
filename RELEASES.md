@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.0.3
+
+### Align ChatGPT Live (GPT Live) defaults with upstream Codex
+
+- Update the default ChatGPT Live model (`DEFAULT_REALTIME_MODEL`) from `gpt-live-1-codex` to `gpt-live-1.1-codex` (matching upstream `openai/codex`).
+- Omit `audio.output.voice` from ChatGPT Live call creation payloads when the caller does not explicitly specify a voice so ChatGPT account voice preferences apply instead of forcing `cove` (explicit `voice` / `audio.output.voice` overrides are still preserved; `DEFAULT_REALTIME_VOICE` updated to `marin`).
+- Add opt-in `sendSessionCloseOnEnd` to `SidebandRelayOptions` so frameless bidirectional live callers can emit `{"type":"session.close"}` before closing the upstream sideband WebSocket.
+
 ## v1.0.2
 
 ### Hosted web_search no longer fails the whole response

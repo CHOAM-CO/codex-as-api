@@ -524,15 +524,31 @@ describe("realtime helpers", () => {
   });
 
   it("normalizes the session payload", () => {
+    assert.equal(DEFAULT_REALTIME_MODEL, "gpt-live-1.1-codex");
     const payload = buildRealtimeSessionPayload({ voice: "marin" });
     assert.deepEqual(payload.audio, { output: { voice: "marin" } });
     assert.deepEqual(payload.delegation, { type: "client" });
     assert.equal(payload.model, DEFAULT_REALTIME_MODEL);
-    assert.equal(buildRealtimeSessionPayload(undefined).audio instanceof Object, true);
-    assert.deepEqual(
-      (buildRealtimeSessionPayload({}).audio as Record<string, unknown>).output,
-      { voice: DEFAULT_REALTIME_VOICE },
-    );
+    // Live mode omits audio.output.voice when caller did not explicitly pass one (upstream Codex #63810).
+    const defaultLive = buildRealtimeSessionPayload(undefined);
+    assert.equal(Object.hasOwn(defaultLive, "audio"), false);
+    assert.equal(defaultLive.model, "gpt-live-1.1-codex");
+    const emptyLive = buildRealtimeSessionPayload({});
+    assert.equal(Object.hasOwn(emptyLive, "audio"), false);
+    // Non-voice audio fields are preserved without injecting a default voice.
+    const audioWithInput = buildRealtimeSessionPayload({ audio: { input: { format: "pcm16" } } });
+    assert.deepEqual(audioWithInput.audio, { input: { format: "pcm16" } });
+    // Explicit nested audio.output.voice and delegation.ack_filler are preserved.
+    const nested = buildRealtimeSessionPayload({
+      audio: { output: { voice: "cove" } },
+      delegation: { type: "client", ack_filler: false },
+    });
+    assert.deepEqual(nested.audio, { output: { voice: "cove" } });
+    assert.deepEqual(nested.delegation, { type: "client", ack_filler: false });
+    // Standard realtime mode keeps explicit gpt-realtime-1.5 and marin defaults.
+    const rt = buildRealtimeSessionPayload({ type: "realtime" }, "realtime");
+    assert.equal(rt.model, "gpt-realtime-1.5");
+    assert.deepEqual(rt.audio, { output: { voice: "marin" } });
   });
 });
 
@@ -1028,6 +1044,48 @@ describe("realtime sideband join failure reason", () => {
       assert.equal(phase2, "error");
       assert.equal(fakeClient2.readyState, WebSocket.CLOSED);
     } finally {
+      await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("sends session.close before closing upstream when sendSessionCloseOnEnd is enabled", async () => {
+    const upstreamHttp = createServer();
+    const upstreamWss = new WebSocketServer({ server: upstreamHttp });
+    const received: string[] = [];
+    let upstreamClosedResolve!: () => void;
+    const upstreamClosed = new Promise<void>((r) => { upstreamClosedResolve = r; });
+    upstreamWss.on("connection", (ws) => {
+      ws.on("message", (data) => received.push(data.toString("utf8")));
+      ws.on("close", () => upstreamClosedResolve());
+    });
+    const upstreamPort = await new Promise<number>((resolve) => {
+      upstreamHttp.listen(0, "127.0.0.1", () => {
+        const addr = upstreamHttp.address();
+        resolve(typeof addr === "object" && addr ? addr.port : 0);
+      });
+    });
+    const { authPath, directory } = writeAuthFile();
+    const EventEmitter = (await import("node:events")).EventEmitter;
+    try {
+      const fakeClient = Object.assign(new EventEmitter(), {
+        readyState: WebSocket.OPEN as number,
+        send() {},
+        close() { fakeClient.readyState = WebSocket.CLOSED; fakeClient.emit("close"); },
+        terminate() { fakeClient.readyState = WebSocket.CLOSED; fakeClient.emit("close"); },
+      });
+      await relayRealtimeSideband(fakeClient as unknown as WebSocket, {
+        callId: "rtc_close_test",
+        authPath,
+        sidebandBaseUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+        versionResolver: () => "0.205.0",
+        sendSessionCloseOnEnd: true,
+      });
+      fakeClient.close();
+      await upstreamClosed;
+      assert.deepEqual(received.map((m) => JSON.parse(m)), [{ type: "session.close" }]);
+    } finally {
+      upstreamWss.close();
       await new Promise<void>((resolve) => upstreamHttp.close(() => resolve()));
       fs.rmSync(directory, { recursive: true, force: true });
     }

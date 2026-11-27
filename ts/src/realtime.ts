@@ -19,9 +19,9 @@ import {
 } from "./provider.js";
 
 /** Default model used for ChatGPT Live (realtime) voice calls. */
-export const DEFAULT_REALTIME_MODEL = "gpt-live-1-codex";
-/** Default voice for ChatGPT Live (realtime) voice calls. */
-export const DEFAULT_REALTIME_VOICE = "cove";
+export const DEFAULT_REALTIME_MODEL = "gpt-live-1.1-codex";
+/** Default fallback voice identifier when an explicit voice is needed. */
+export const DEFAULT_REALTIME_VOICE = "marin";
 /**
  * Default model and voice for standard Realtime calls (`mode: "realtime"`): the
  * function-calling voice model Codex defaults to on its v2 wire (openai/codex
@@ -205,11 +205,11 @@ export function buildRealtimeSessionPayload(
     audio.output != null && typeof audio.output === "object" && !Array.isArray(audio.output)
       ? { ...(audio.output as Record<string, unknown>) }
       : {};
-  const voice = typeof incoming.voice === "string" && incoming.voice.trim().length > 0
-    ? incoming.voice
+  const explicitVoice = typeof incoming.voice === "string" && incoming.voice.trim().length > 0
+    ? incoming.voice.trim()
     : typeof output.voice === "string" && output.voice.trim().length > 0
-      ? output.voice
-      : mode === "realtime" ? DEFAULT_REALTIME_V2_VOICE : DEFAULT_REALTIME_VOICE;
+      ? output.voice.trim()
+      : null;
   delete incoming.voice;
 
   const model = typeof incoming.model === "string" && incoming.model.trim().length > 0
@@ -217,6 +217,7 @@ export function buildRealtimeSessionPayload(
     : mode === "realtime" ? DEFAULT_REALTIME_V2_MODEL : DEFAULT_REALTIME_MODEL;
   if (mode === "realtime") {
     // Tools, not delegation: a standard Realtime session has no `delegation`.
+    const voice = explicitVoice ?? DEFAULT_REALTIME_V2_VOICE;
     return { ...incoming, type: "realtime", audio: { ...audio, output: { ...output, voice } }, model };
   }
   const delegation =
@@ -226,12 +227,28 @@ export function buildRealtimeSessionPayload(
       ? incoming.delegation
       : { type: "client" };
 
-  return {
+  // Upstream Codex (#63810): omit voice override on GPT Live startup when caller did not
+  // specify one so ChatGPT account voice preferences apply instead of forcing a fallback.
+  delete incoming.audio;
+  if (explicitVoice != null) {
+    audio.output = { ...output, voice: explicitVoice };
+  } else {
+    delete output.voice;
+    if (Object.keys(output).length > 0) {
+      audio.output = output;
+    } else {
+      delete audio.output;
+    }
+  }
+  const payload: Record<string, unknown> = {
     ...incoming,
-    audio: { ...audio, output: { ...output, voice } },
     delegation,
     model,
   };
+  if (Object.keys(audio).length > 0) {
+    payload.audio = audio;
+  }
+  return payload;
 }
 
 async function realtimeAuthHeaders(
@@ -394,6 +411,8 @@ export interface SidebandRelayOptions {
   /** Wall-clock deadline in milliseconds for each WebSocket handshake attempt (default: 10000). */
   handshakeTimeoutMs?: number;
   versionResolver?: CodexVersionProvider;
+  /** When true, send `{"type":"session.close"}` before closing the upstream sideband socket. */
+  sendSessionCloseOnEnd?: boolean;
 }
 
 function isClientActive(client: WebSocket): boolean {
@@ -522,6 +541,9 @@ async function relayRealtimeSidebandImpl(
   });
   client.on("close", () => {
     try {
+      if (options.sendSessionCloseOnEnd && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "session.close" }));
+      }
       socket.close();
     } catch {
       /* already closed */

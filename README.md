@@ -552,8 +552,8 @@ backend. The client owns the media plane: it sends its own WebRTC SDP offer and
 applies the returned answer, so no audio is relayed through this proxy.
 
 The body is `{"sdp": "<offer>", "session": {...}}`. `session` may carry
-`instructions`, a `voice` (default `cove`), and any additional ChatGPT Live
-session field; `model` defaults to `gpt-live-1-codex`, and `delegation` defaults
+`instructions`, an optional `voice` override (omitted by default so ChatGPT account voice preferences apply), and any additional ChatGPT Live
+session field; `model` defaults to `gpt-live-1.1-codex`, and `delegation` defaults
 to `{"type": "client"}`. The route rejects unknown top-level fields and any
 client-chosen voice-session id (`id`, `session_id`, `voice_session_id`), because
 the backend denies calls that set those itself. On success it returns `201` with
